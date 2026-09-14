@@ -1,0 +1,34 @@
+[proxy]
+listen = "127.0.0.1:8080"
+pac_listen = "127.0.0.1:8081"
+allowed_ports = [443]
+
+[dns]
+# The endpoint host must be bootstrap-reachable without resolving a selected/blocked domain.
+# Prefer a literal-IP HTTPS endpoint with a certificate valid for that IP, as below, or an
+# independently resolvable non-target host. HTTPS authentication is mandatory; an optional
+# ca_certificate may add trusted roots but never disables certificate verification.
+upstream = "https://1.1.1.1/dns-query"
+timeout_seconds = 10
+cache_max_ttl_seconds = 300
+cache_capacity = 256
+max_response_bytes = 65536
+
+[limits]
+max_connect_header_bytes = 16384
+max_client_hello_bytes = 262144
+max_connections = 256
+connect_timeout_seconds = 10
+client_hello_timeout_seconds = 5
+idle_timeout_seconds = 300
+shutdown_timeout_seconds = 10
+
+[[targets]]
+host = "reddit.com"
+include_subdomains = true
+strategy = "tls-record-split"
+
+[[targets]]
+host = "medium.com"
+include_subdomains = true
+strategy = "tls-record-split"
