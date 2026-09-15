@@ -2,6 +2,8 @@
 
 SplitHello is a local HTTPS CONNECT proxy for selected websites. It uses authenticated DNS-over-HTTPS (DoH) and splits the TLS ClientHello across valid TLS records. Other HTTPS traffic passes through unchanged.
 
+Inspired by [tuananh/dpi-bypass](https://github.com/tuananh/dpi-bypass).
+
 ## Run
 
 Build and start:
