@@ -1,7 +1,14 @@
+# SplitHello configuration. Only `targets` is required; every other value shown is the
+# default. `splithello init` writes this file; `splithello check` validates it.
+
+# Sites that use DoH + ClientHello splitting. A plain host also covers its subdomains;
+# use { host = "example.com", subdomains = false } to match one exact host.
+targets = ["reddit.com", "medium.com"]
+
 [proxy]
-listen = "127.0.0.1:8080"
-pac_listen = "127.0.0.1:8081"
-allowed_ports = [443]
+listen = "127.0.0.1:8080" # browser HTTPS proxy address
+pac = "127.0.0.1:8081"    # serves http://127.0.0.1:8081/proxy.pac; pac = false disables it
+ports = [443]             # CONNECT ports to accept (443 and/or 8443)
 
 [dns]
 # The endpoint host must be bootstrap-reachable without resolving a selected/blocked domain.
@@ -9,26 +16,18 @@ allowed_ports = [443]
 # independently resolvable non-target host. HTTPS authentication is mandatory; an optional
 # ca_certificate may add trusted roots but never disables certificate verification.
 upstream = "https://1.1.1.1/dns-query"
-timeout_seconds = 10
-cache_max_ttl_seconds = 300
-cache_capacity = 256
-max_response_bytes = 65536
+timeout = "10s"
+cache_ttl = "5m"  # upper bound; shorter DNS answer TTLs win
+cache_size = 256
+# ca_certificate = "extra-roots.pem"
+# max_response_bytes = 65536
 
-[limits]
-max_connect_header_bytes = 16384
-max_client_hello_bytes = 262144
-max_connections = 256
-connect_timeout_seconds = 10
-client_hello_timeout_seconds = 5
-idle_timeout_seconds = 300
-shutdown_timeout_seconds = 10
-
-[[targets]]
-host = "reddit.com"
-include_subdomains = true
-strategy = "tls-record-split"
-
-[[targets]]
-host = "medium.com"
-include_subdomains = true
-strategy = "tls-record-split"
+# Rarely needed; durations accept units like "750ms", "10s", "5m".
+# [limits]
+# max_connections = 256
+# connect_timeout = "10s"
+# client_hello_timeout = "5s"
+# idle_timeout = "5m"
+# shutdown_timeout = "10s"
+# max_connect_header_bytes = 16384
+# max_client_hello_bytes = 262144

@@ -24,11 +24,36 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(120);
 #[derive(Clone, Debug)]
 pub enum DohResponse {
     Addresses(Vec<Ipv4Addr>),
     Raw(Vec<u8>),
     HttpStatus(u16),
+}
+
+/// Network model for [`TestDoh`]. The defaults match the original test server:
+/// one request per connection, no added latency, 30 second answer TTL.
+#[derive(Clone, Debug)]
+pub struct DohOptions {
+    pub response: DohResponse,
+    /// Serve several requests per TLS connection, as public DoH servers do.
+    pub keep_alive: bool,
+    /// Simulated round-trip time: a new connection waits `2 * rtt` (TCP + TLS 1.3)
+    /// before the handshake and each query waits `rtt` before its answer.
+    pub rtt: Duration,
+    pub ttl: u32,
+}
+
+impl DohOptions {
+    pub fn new(response: DohResponse) -> Self {
+        Self {
+            response,
+            keep_alive: false,
+            rtt: Duration::ZERO,
+            ttl: 30,
+        }
+    }
 }
 
 pub struct TestDoh {
@@ -42,17 +67,21 @@ pub struct TestDoh {
 
 impl TestDoh {
     pub async fn start(response: DohResponse) -> Self {
+        Self::start_with(DohOptions::new(response)).await
+    }
+
+    pub async fn start_with(options: DohOptions) -> Self {
         let directory = tempfile::tempdir().expect("create DoH certificate directory");
-        let (ca_pem, server_config) = generated_tls_material(directory.path());
+        let material = tls_material(directory.path(), &["localhost"]);
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind HTTPS DoH listener");
         let addr = listener.local_addr().expect("inspect DoH listener");
         let queries = Arc::new(Mutex::new(Vec::new()));
-        let response = Arc::new(Mutex::new(response));
+        let response = Arc::new(Mutex::new(options.response.clone()));
         let task_queries = Arc::clone(&queries);
         let task_response = Arc::clone(&response);
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let acceptor = TlsAcceptor::from(Arc::new(material.server));
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -61,65 +90,58 @@ impl TestDoh {
                 let acceptor = acceptor.clone();
                 let queries = Arc::clone(&task_queries);
                 let response = Arc::clone(&task_response);
+                let options = options.clone();
                 tokio::spawn(async move {
+                    sleep_rtt(options.rtt * 2).await;
                     let Ok(mut stream) = acceptor.accept(stream).await else {
                         return;
                     };
-                    let Ok(request) = read_http_request(&mut stream).await else {
-                        return;
+                    let idle = if options.keep_alive {
+                        KEEP_ALIVE_IDLE
+                    } else {
+                        TEST_TIMEOUT
                     };
-                    let Some(header_end) = request
-                        .windows(4)
-                        .position(|part| part == b"\r\n\r\n")
-                        .map(|p| p + 4)
-                    else {
-                        return;
-                    };
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if request.len() < header_end + content_length {
-                        return;
-                    }
-                    let Ok(query) =
-                        Message::from_vec(&request[header_end..header_end + content_length])
-                    else {
-                        return;
-                    };
-                    queries.lock().expect("query lock").push(query.clone());
-                    let configured = response.lock().expect("response lock").clone();
-                    match configured {
-                        DohResponse::Addresses(addresses) => {
-                            let mut dns = Message::new(
-                                query.metadata.id,
-                                MessageType::Response,
-                                OpCode::Query,
-                            );
-                            dns.add_query(query.queries[0].clone());
-                            for address in addresses {
-                                dns.add_answer(Record::from_rdata(
-                                    query.queries[0].name().clone(),
-                                    30,
-                                    RData::A(A(address)),
-                                ));
+                    loop {
+                        let Ok(request) = read_http_request(&mut stream, idle).await else {
+                            return;
+                        };
+                        let Some(query) = parse_doh_request(&request) else {
+                            return;
+                        };
+                        queries.lock().expect("query lock").push(query.clone());
+                        sleep_rtt(options.rtt).await;
+                        let configured = response.lock().expect("response lock").clone();
+                        let (status, content_type, body) = match configured {
+                            DohResponse::Addresses(addresses) => {
+                                let mut dns = Message::new(
+                                    query.metadata.id,
+                                    MessageType::Response,
+                                    OpCode::Query,
+                                );
+                                dns.add_query(query.queries[0].clone());
+                                for address in addresses {
+                                    dns.add_answer(Record::from_rdata(
+                                        query.queries[0].name().clone(),
+                                        options.ttl,
+                                        RData::A(A(address)),
+                                    ));
+                                }
+                                let body = dns.to_vec().expect("encode test DNS response");
+                                (200, "application/dns-message", body)
                             }
-                            let body = dns.to_vec().expect("encode test DNS response");
-                            write_http_response(&mut stream, 200, "application/dns-message", &body)
-                                .await;
-                        }
-                        DohResponse::Raw(body) => {
-                            write_http_response(&mut stream, 200, "application/dns-message", &body)
-                                .await;
-                        }
-                        DohResponse::HttpStatus(status) => {
-                            write_http_response(&mut stream, status, "text/plain", b"").await;
+                            DohResponse::Raw(body) => (200, "application/dns-message", body),
+                            DohResponse::HttpStatus(status) => (status, "text/plain", Vec::new()),
+                        };
+                        write_http_response(
+                            &mut stream,
+                            status,
+                            content_type,
+                            &body,
+                            options.keep_alive,
+                        )
+                        .await;
+                        if !options.keep_alive {
+                            return;
                         }
                     }
                 });
@@ -127,7 +149,7 @@ impl TestDoh {
         });
         Self {
             addr,
-            ca_pem,
+            ca_pem: material.ca_pem,
             queries,
             response,
             task,
@@ -141,6 +163,21 @@ impl TestDoh {
 
     pub fn queries(&self) -> Vec<Message> {
         self.queries.lock().expect("query lock").clone()
+    }
+
+    /// Lower-case names of every query received, without the trailing dot.
+    pub fn queried_names(&self) -> Vec<String> {
+        self.queries()
+            .iter()
+            .flat_map(|message| message.queries.iter())
+            .map(|query| {
+                query
+                    .name()
+                    .to_ascii()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .collect()
     }
 
     pub async fn wait_for_queries(&self, count: usize) -> Vec<Message> {
@@ -274,23 +311,45 @@ pub struct RunningSplitHello {
 
 impl RunningSplitHello {
     pub fn start(config: TestConfig<'_>) -> Self {
-        let directory = tempfile::tempdir().expect("create process config directory");
         let configured_proxy = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         let configured_pac = config
             .with_pac
             .then_some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
-        let config_path = directory.path().join("config.toml");
-        fs::write(
-            &config_path,
-            config.render(configured_proxy, configured_pac),
+        // Tests assert on every tunnel outcome, including DEBUG-level direct relays.
+        Self::spawn(
+            Path::new(env!("CARGO_BIN_EXE_splithello")),
+            &config.render(configured_proxy, configured_pac),
+            config.with_pac,
+            "debug",
         )
-        .expect("write process configuration");
+    }
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_splithello"))
+    /// Starts the compiled binary with literal configuration text whose listeners
+    /// use kernel-assigned loopback ports.
+    pub fn start_with_config(config_text: &str, with_pac: bool) -> Self {
+        Self::start_binary(
+            Path::new(env!("CARGO_BIN_EXE_splithello")),
+            config_text,
+            with_pac,
+        )
+    }
+
+    /// Like [`Self::start_with_config`] for an arbitrary build, e.g. a base-ref binary
+    /// in a paired benchmark. Logs at the default `info` level, as a user would run it.
+    pub fn start_binary(binary: &Path, config_text: &str, with_pac: bool) -> Self {
+        Self::spawn(binary, config_text, with_pac, "info")
+    }
+
+    fn spawn(binary: &Path, config_text: &str, with_pac: bool, rust_log: &str) -> Self {
+        let directory = tempfile::tempdir().expect("create process config directory");
+        let config_path = directory.path().join("config.toml");
+        fs::write(&config_path, config_text).expect("write process configuration");
+
+        let mut child = Command::new(binary)
             .arg("start")
             .arg("--config")
             .arg(&config_path)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", rust_log)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -308,7 +367,7 @@ impl RunningSplitHello {
         let proxy_addr = parse_ready_socket(&ready_output, "proxy_addr=")
             .expect("ready output contains actual proxy address");
         let pac_addr = parse_ready_socket(&ready_output, "pac_url=\"http://");
-        assert_eq!(pac_addr.is_some(), config.with_pac);
+        assert_eq!(pac_addr.is_some(), with_pac);
         if let Some(pac_addr) = pac_addr {
             assert_ne!(
                 proxy_addr, pac_addr,
@@ -378,22 +437,20 @@ pub struct TestConfig<'a> {
 }
 
 impl TestConfig<'_> {
-    fn render(&self, proxy: SocketAddr, pac: Option<SocketAddr>) -> String {
-        let pac = pac
-            .map(|addr| format!("pac_listen = \"{addr}\"\n"))
-            .unwrap_or_default();
+    pub fn render(&self, proxy: SocketAddr, pac: Option<SocketAddr>) -> String {
+        let pac = pac.map_or_else(|| "false".to_owned(), |addr| format!("\"{addr}\""));
         let secret = self
             .injected_secret
             .map(|secret| format!("# {secret}\n"))
             .unwrap_or_default();
         format!(
-            "{secret}[proxy]\nlisten = \"{proxy}\"\n{pac}allowed_ports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout_seconds = 1\ncache_max_ttl_seconds = 30\ncache_capacity = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout_seconds = 1\nclient_hello_timeout_seconds = 1\nidle_timeout_seconds = 2\nshutdown_timeout_seconds = {}\n\n[[targets]]\nhost = \"{}\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n",
+            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
+            self.target_host,
             self.origin_port,
             self.doh.url(),
             self.doh.ca_pem.display(),
             self.max_connections,
             self.shutdown_seconds,
-            self.target_host,
         )
     }
 }
@@ -509,7 +566,15 @@ fn encode_records(handshake: &[u8], splits: &[usize]) -> Vec<u8> {
     output
 }
 
-fn generated_tls_material(directory: &Path) -> (PathBuf, ServerConfig) {
+pub struct TlsMaterial {
+    pub ca_pem: PathBuf,
+    pub ca_der: CertificateDer<'static>,
+    pub server: ServerConfig,
+}
+
+/// Generates a throwaway CA plus a server certificate for `names`
+/// (wildcards such as `*.bench.test` are allowed).
+pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut ca_params = CertificateParams::new(vec!["SplitHello test CA".to_owned()])
         .expect("create CA parameters");
@@ -525,31 +590,67 @@ fn generated_tls_material(directory: &Path) -> (PathBuf, ServerConfig) {
         .expect("sign CA certificate");
     let ca_pem = directory.join("ca.pem");
     fs::write(&ca_pem, ca_cert.pem()).expect("write CA PEM");
+    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
     let issuer = Issuer::new(ca_params, ca_key);
 
-    let server_params = CertificateParams::new(vec!["localhost".to_owned()])
-        .expect("create server certificate parameters");
+    let names = names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let server_params =
+        CertificateParams::new(names).expect("create server certificate parameters");
     let server_key = KeyPair::generate().expect("generate server key");
     let server_cert = server_params
         .signed_by(&server_key, &issuer)
-        .expect("sign localhost certificate");
+        .expect("sign server certificate");
     let cert_chain = vec![CertificateDer::from(server_cert.der().to_vec())];
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
-    let config = ServerConfig::builder()
+    let server = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .expect("build test TLS server config");
-    (ca_pem, config)
+    TlsMaterial {
+        ca_pem,
+        ca_der,
+        server,
+    }
 }
 
-async fn read_http_request<S>(stream: &mut S) -> std::io::Result<Vec<u8>>
+async fn sleep_rtt(duration: Duration) {
+    if !duration.is_zero() {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+fn parse_doh_request(request: &[u8]) -> Option<Message> {
+    let header_end = request
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .map(|p| p + 4)?;
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    if request.len() < header_end + content_length {
+        return None;
+    }
+    Message::from_vec(&request[header_end..header_end + content_length]).ok()
+}
+
+async fn read_http_request<S>(stream: &mut S, idle: Duration) -> std::io::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut request = Vec::new();
     loop {
         let mut buffer = [0_u8; 1024];
-        let read = timeout(TEST_TIMEOUT, stream.read(&mut buffer))
+        let read = timeout(idle, stream.read(&mut buffer))
             .await
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP request timeout")
@@ -580,18 +681,29 @@ where
     }
 }
 
-async fn write_http_response<S>(stream: &mut S, status: u16, content_type: &str, body: &[u8])
-where
+async fn write_http_response<S>(
+    stream: &mut S,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    keep_alive: bool,
+) where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let reason = if status == 200 { "OK" } else { "Failure" };
+    let connection = if keep_alive { "keep-alive" } else { "close" };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(body).await;
-    let _ = stream.shutdown().await;
+    let mut response = head.into_bytes();
+    response.extend_from_slice(body);
+    let _ = stream.write_all(&response).await;
+    if keep_alive {
+        let _ = stream.flush().await;
+    } else {
+        let _ = stream.shutdown().await;
+    }
 }
 
 async fn read_http_headers(stream: &mut TcpStream) -> Vec<u8> {

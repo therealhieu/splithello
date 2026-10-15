@@ -9,11 +9,13 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ConfigError};
-use crate::diagnostics::Outcome;
+use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
-use crate::domain::DomainError;
+use crate::domain::{DomainError, DomainName};
 use crate::pac::{PacServer, PacServiceError, render_pac};
 use crate::proxy::{ProxyLimits, ProxyServer, ProxyServiceError, ProxyState};
+
+const SUMMARY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadyMetadata {
@@ -60,8 +62,6 @@ impl ReadyMetadata {
             target_count = self.target_count,
             doh_host = %self.doh_host,
             transport = self.transport(),
-            setup = "configure the browser HTTPS proxy or PAC URL",
-            scope = "explicit loopback proxy; not a VPN",
             "SplitHello is ready"
         );
     }
@@ -71,6 +71,16 @@ impl ReadyMetadata {
 pub(crate) enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error("could not determine a configuration path; set HOME or pass --config <PATH>")]
+    NoConfigPath,
+    #[error("{} already exists; pass --force to overwrite it", path.display())]
+    InitExists { path: std::path::PathBuf },
+    #[error("could not write {}: {source}", path.display())]
+    InitWrite {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not construct authenticated target resolver")]
     Resolver(#[source] ResolveError),
     #[error("could not compile target policy")]
@@ -104,7 +114,8 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn outcome(&self) -> Outcome {
         match self {
-            Self::Config(_) => Outcome::ConfigError,
+            Self::Config(_) | Self::NoConfigPath | Self::InitExists { .. } => Outcome::ConfigError,
+            Self::InitWrite { .. } => Outcome::InternalError,
             Self::Resolver(_) => Outcome::DnsError,
             Self::Domain(_) => Outcome::ConfigError,
             Self::ProxyBind { .. }
@@ -139,11 +150,12 @@ impl Runtime {
         };
         let state = Arc::new(ProxyState::new(
             matcher,
-            target_resolver,
+            target_resolver.clone(),
             config.proxy().allowed_ports().iter().copied(),
             limits,
             config.limits().max_connections(),
         ));
+        let stats = state.stats();
         let cancel = CancellationToken::new();
         let shutdown_timeout = config.limits().shutdown_timeout();
 
@@ -206,6 +218,17 @@ impl Runtime {
             );
             tasks.spawn(async move { pac.run().await.map_err(AppError::from) });
         }
+        tasks.spawn(report_summaries(stats, cancel.child_token()));
+        // Detached: it finishes on its own, which `tasks` would read as a stopped service.
+        tokio::spawn(prewarm_targets(
+            target_resolver,
+            config
+                .targets()
+                .iter()
+                .map(|target| target.host().clone())
+                .collect(),
+            cancel.child_token(),
+        ));
 
         Ok(Self {
             cancel,
@@ -246,6 +269,44 @@ impl Runtime {
     pub(crate) async fn shutdown(mut self) -> Result<(), AppError> {
         self.cancel.cancel();
         drain_tasks(&mut self.tasks, self.shutdown_timeout).await
+    }
+}
+
+/// Logs one summary line per window that saw traffic, so a quiet terminal still shows
+/// the proxy is alive and how traffic splits between targets and direct relays.
+async fn report_summaries(
+    stats: Arc<ProxyStats>,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    let mut interval = tokio::time::interval_at(Instant::now() + SUMMARY_WINDOW, SUMMARY_WINDOW);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                let window = stats.take_window();
+                if window.tunnels() > 0 {
+                    log_summary(SUMMARY_WINDOW, window);
+                }
+            }
+        }
+    }
+}
+
+/// Resolves every target apex once in the background, so the first browser request
+/// skips the DoH connection setup and lookup. Best effort: failures are logged at DEBUG.
+async fn prewarm_targets(
+    resolver: Arc<DohResolver>,
+    hosts: Vec<DomainName>,
+    cancel: CancellationToken,
+) {
+    let mut lookups = JoinSet::new();
+    for host in hosts {
+        let resolver = resolver.clone();
+        lookups.spawn(async move { resolver.prewarm(&host).await });
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = lookups.join_all() => {}
     }
 }
 
@@ -319,11 +380,9 @@ mod tests {
     use super::{AppError, Runtime, drain_tasks};
 
     fn config_text(proxy: &str, pac: Option<&str>, shutdown_seconds: u64) -> String {
-        let pac = pac
-            .map(|address| format!("pac_listen = \"{address}\"\n"))
-            .unwrap_or_default();
+        let pac = pac.map_or_else(|| "false".to_owned(), |address| format!("\"{address}\""));
         format!(
-            "[proxy]\nlisten = \"{proxy}\"\n{pac}\n[dns]\nupstream = \"https://1.1.1.1/dns-query\"\n\n[limits]\nshutdown_timeout_seconds = {shutdown_seconds}\n\n[[targets]]\nhost = \"reddit.com\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n"
+            "targets = [\"reddit.com\"]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\n\n[limits]\nshutdown_timeout = \"{shutdown_seconds}s\"\n"
         )
     }
 
