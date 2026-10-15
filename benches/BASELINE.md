@@ -34,9 +34,10 @@ scripts/bench.sh snapshot <label>  # record that run in benches/results/ and bel
   same commit differed by up to 35% on a loaded laptop; paired rounds of identical binaries stay
   within about ±5%.
 - **CI merge gate** (`.github/workflows/ci.yml`, job `bench-gate`): every pull request runs
-  `compare origin/<base branch>` on a macOS runner with `SPLITHELLO_BENCH_REQUIRE_FASTER=1`.
-  It passes only when no scenario regresses **and** at least one scenario is faster (whole CI
-  below −1%). The table is published in the job summary and as the `bench-gate` artifact.
+  `compare origin/<base branch>` on a macOS runner with `SPLITHELLO_BENCH_NO_SLOWER=1`.
+  The rule is **faster or equal**: it fails if any scenario is significantly slower (whole CI
+  above +1%); "≈ same" and "faster" pass. The table is published in the job summary and as the
+  `bench-gate` artifact.
 - **History** (reference only): each PR commits one snapshot. Absolute numbers move with machine
   load, so compare them only within one machine row and trust the gate for verdicts.
 - Loopback tunnels pin two ephemeral ports each for the 30s TIME_WAIT window. The bench paces

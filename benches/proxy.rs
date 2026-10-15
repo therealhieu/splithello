@@ -52,9 +52,9 @@ const THROUGHPUT_DOWN: u64 = 64 * 1024 * 1024;
 const THROUGHPUT_BIDIR: u64 = 32 * 1024 * 1024;
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 const BASE_BIN_ENV: &str = "SPLITHELLO_BENCH_BASE_BIN";
-/// When set to `1`, the paired gate also fails unless at least one scenario is faster:
-/// the merge rule for PRs is "no regression, and measurably faster than the base".
-const REQUIRE_FASTER_ENV: &str = "SPLITHELLO_BENCH_REQUIRE_FASTER";
+/// When set to `1`, the paired gate fails on any significant slowdown (whole 95% CI above
+/// +1%), not only beyond [`REGRESSION_GATE`]: the PR merge rule is "faster or equal".
+const NO_SLOWER_ENV: &str = "SPLITHELLO_BENCH_NO_SLOWER";
 /// A regression fails the gate only when the whole 95% CI of the median change is above it.
 const REGRESSION_GATE: f64 = 0.05;
 const NOISE: f64 = 0.01;
@@ -730,7 +730,7 @@ struct PairedResult {
 
 /// Measures base and HEAD in alternating rounds (A B B A A B …) and prints the gate table.
 /// Exits non-zero when a scenario regressed beyond [`REGRESSION_GATE`], or, with
-/// [`REQUIRE_FASTER_ENV`], when no scenario got faster.
+/// [`NO_SLOWER_ENV`], when any scenario is significantly slower.
 fn paired_compare(base_binary: &Path) {
     let runtime = runtime();
     let head_binary = head_binary();
@@ -786,8 +786,9 @@ fn paired_compare(base_binary: &Path) {
     let verdicts = print_paired_table(&results);
     write_paired_json(&results);
     let regressed = verdicts.names(Verdict::Regressed);
+    let slower = verdicts.names(Verdict::Slower);
     let faster = verdicts.names(Verdict::Faster);
-    let require_faster = std::env::var_os(REQUIRE_FASTER_ENV).is_some_and(|value| value == "1");
+    let no_slower = std::env::var_os(NO_SLOWER_ENV).is_some_and(|value| value == "1");
     println!();
     if !regressed.is_empty() {
         println!(
@@ -797,8 +798,11 @@ fn paired_compare(base_binary: &Path) {
         );
         std::process::exit(1);
     }
-    if require_faster && faster.is_empty() {
-        println!("**Gate: FAIL**: no scenario is faster than the base (95% CI below -1%)");
+    if no_slower && !slower.is_empty() {
+        println!(
+            "**Gate: FAIL**: slower than the base (95% CI above +1%): {}",
+            slower.join(", ")
+        );
         std::process::exit(1);
     }
     let faster = if faster.is_empty() {
@@ -806,7 +810,7 @@ fn paired_compare(base_binary: &Path) {
     } else {
         faster.join(", ")
     };
-    println!("**Gate: PASS**: no regression; faster: {faster}");
+    println!("**Gate: PASS**: faster or equal; faster: {faster}");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

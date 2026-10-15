@@ -4,8 +4,8 @@
 #   scripts/bench.sh compare [base-ref] [filter]  build <base-ref> (default: main) in a temporary
 #                                                 worktree, then measure base and HEAD in
 #                                                 alternating rounds; fails on a >5% regression,
-#                                                 and with SPLITHELLO_BENCH_REQUIRE_FASTER=1 also
-#                                                 when no scenario is faster (the CI merge gate)
+#                                                 and with SPLITHELLO_BENCH_NO_SLOWER=1 on any
+#                                                 significant slowdown (the CI merge gate)
 #   scripts/bench.sh run [criterion args]         criterion run of HEAD (feeds `snapshot`)
 #   scripts/bench.sh snapshot <label>             record the latest `run` in benches/results/
 set -euo pipefail

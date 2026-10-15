@@ -25,8 +25,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # Merge rule: a PR may merge only when it is measurably faster than its base branch and
-  # no scenario regresses. Base and PR binaries are measured in alternating rounds on the
+  # Merge rule: "faster or equal". A PR fails if any scenario is significantly slower than
+  # its base branch (whole 95% CI above +1%). Base and PR binaries are measured in alternating rounds on the
   # same runner, so runner-to-runner speed differences cancel out (see benches/BASELINE.md).
   # macOS because the harness paces tunnels for macOS loopback TIME_WAIT (2×MSL = 30 s).
   bench-gate:
@@ -42,7 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Paired benchmark against the base branch
         env:
-          SPLITHELLO_BENCH_REQUIRE_FASTER: "1"
+          SPLITHELLO_BENCH_NO_SLOWER: "1"
           BASE_REF: origin/${{ github.base_ref }}
         run: |
           set -o pipefail
