@@ -43,10 +43,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Start the local proxy.
+    /// Start the local proxy; writes a starter configuration first if none exists.
     Start(ConfigArgs),
-    /// Write a starter configuration file.
-    Init(InitArgs),
     /// Validate the configuration, check listeners, and resolve every target over DoH.
     Check(ConfigArgs),
 }
@@ -64,15 +62,6 @@ impl ConfigArgs {
     pub(crate) fn path(&self) -> Option<PathBuf> {
         self.config.clone().or_else(default_config_path)
     }
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct InitArgs {
-    #[command(flatten)]
-    pub(crate) config: ConfigArgs,
-    /// Overwrite an existing configuration file.
-    #[arg(long)]
-    pub(crate) force: bool,
 }
 
 pub(crate) fn default_config_path() -> Option<PathBuf> {
@@ -125,17 +114,16 @@ mod tests {
     }
 
     #[test]
-    fn init_and_check_share_the_config_flag() {
-        let cli = Cli::try_parse_from(["splithello", "init", "--config", "a.toml", "--force"])
-            .expect("valid CLI");
-        let Command::Init(args) = cli.command else {
-            panic!("expected init");
+    fn check_shares_the_config_flag_and_init_is_gone() {
+        let cli =
+            Cli::try_parse_from(["splithello", "check", "--config", "a.toml"]).expect("valid CLI");
+        let Command::Check(args) = cli.command else {
+            panic!("expected check");
         };
-        assert!(args.force);
-        assert_eq!(args.config.config, Some(PathBuf::from("a.toml")));
+        assert_eq!(args.config, Some(PathBuf::from("a.toml")));
 
-        let cli = Cli::try_parse_from(["splithello", "check"]).expect("valid CLI");
-        assert!(matches!(cli.command, Command::Check(_)));
+        let error = Cli::try_parse_from(["splithello", "init"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

@@ -102,7 +102,7 @@ pub(crate) enum Strategy {
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
-    #[error("no configuration at {}; run `splithello init` to create one", path.display())]
+    #[error("no configuration at {}", path.display())]
     NotFound { path: PathBuf },
     #[error("could not read configuration {}: {source}", path.display())]
     Read {
@@ -1004,12 +1004,12 @@ shutdown_timeout = "1m"
     }
 
     #[test]
-    fn missing_file_points_at_init() {
+    fn missing_file_names_its_path() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("absent.toml");
         let error = Config::load(&path).unwrap_err();
         assert!(matches!(error, ConfigError::NotFound { .. }));
-        assert!(error.to_string().contains("run `splithello init`"));
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 
     #[test]
@@ -1033,8 +1033,21 @@ shutdown_timeout = "1m"
     #[test]
     fn repository_example_and_readme_define_the_same_operating_contract() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let config = Config::load(&root.join("config.example.toml"))
-            .expect("repository example must load through production Config::load");
+        // The example is the starter file: it ships with no targets so `start` stops until
+        // the user picks sites, and its commented example line is the suggested list.
+        let example_path = root.join("config.example.toml");
+        assert!(matches!(
+            Config::load(&example_path),
+            Err(ConfigError::EmptyTargets)
+        ));
+        let starter = fs::read_to_string(&example_path).expect("read repository example");
+        let suggested = "# targets = [\"reddit.com\", \"medium.com\"]";
+        assert!(
+            starter.contains(suggested),
+            "example is missing `{suggested}`"
+        );
+        let config = Config::parse(&starter.replace("targets = []", &suggested[2..]), root)
+            .expect("repository example with targets must parse");
         let defaults = parse("targets = [\"reddit.com\", \"medium.com\"]\n").unwrap();
 
         assert_eq!(config.proxy.listen, defaults.proxy.listen);
@@ -1060,10 +1073,8 @@ shutdown_timeout = "1m"
         let readme = fs::read_to_string(root.join("README.md")).expect("read repository README");
         for required in [
             "cargo build --release",
-            "./target/release/splithello init",
-            "./target/release/splithello check",
             "./target/release/splithello start",
-            "--config config.example.toml",
+            "--config <PATH>",
             "127.0.0.1:8080",
             "http://127.0.0.1:8081/proxy.pac",
             "outcome=ready",

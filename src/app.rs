@@ -73,10 +73,8 @@ pub(crate) enum AppError {
     Config(#[from] ConfigError),
     #[error("could not determine a configuration path; set HOME or pass --config <PATH>")]
     NoConfigPath,
-    #[error("{} already exists; pass --force to overwrite it", path.display())]
-    InitExists { path: std::path::PathBuf },
-    #[error("could not write {}: {source}", path.display())]
-    InitWrite {
+    #[error("could not write starter configuration {}: {source}", path.display())]
+    ConfigWrite {
         path: std::path::PathBuf,
         #[source]
         source: std::io::Error,
@@ -114,8 +112,8 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn outcome(&self) -> Outcome {
         match self {
-            Self::Config(_) | Self::NoConfigPath | Self::InitExists { .. } => Outcome::ConfigError,
-            Self::InitWrite { .. } => Outcome::InternalError,
+            Self::Config(_) | Self::NoConfigPath => Outcome::ConfigError,
+            Self::ConfigWrite { .. } => Outcome::InternalError,
             Self::Resolver(_) => Outcome::DnsError,
             Self::Domain(_) => Outcome::ConfigError,
             Self::ProxyBind { .. }
