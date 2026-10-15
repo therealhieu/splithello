@@ -1,0 +1,205 @@
+name: release
+# A pushed `v*` tag builds every target, publishes a GitHub release, then the Homebrew
+# formula and the crates.io package (not for prereleases, whose tags contain `-`).
+# A manual run is a dry run: the same builds and checks, nothing published.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The tag must name the version already in Cargo.toml, so the binary, the crate and
+      # the release all agree.
+      - id: version
+        run: |
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          V="$crate"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            V="${GITHUB_REF_NAME#v}"
+            if [[ "$V" != "$crate" ]]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+              exit 1
+            fi
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each target builds on its own OS and CPU: no cross toolchain, and the smoke test runs.
+        include:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    env:
+      V: ${{ needs.version.outputs.version }}
+      T: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$T"
+      # Archives hold the binary at the root, where `splithello update` looks for it.
+      - name: Smoke test and package
+        shell: bash
+        run: |
+          exe=splithello
+          if [[ "$T" == *windows* ]]; then exe=splithello.exe; fi
+          bin="target/$T/release/$exe"
+          test "$("$bin" --version | tr -d '\r')" = "splithello $V"
+          name="splithello-v$V-$T"
+          mkdir -p stage dist
+          cp "$bin" LICENSE README.md stage/
+          if [[ "$T" == *windows* ]]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path stage/$exe, stage/LICENSE, stage/README.md -DestinationPath dist/$name.zip"
+          else
+            tar -C stage -czf "dist/$name.tar.gz" "$exe" LICENSE README.md
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  channels-dry-run:
+    # Installs the formula from the built archives and packages the crate, publishing nothing.
+    needs: [version, build]
+    runs-on: macos-15
+    env:
+      V: ${{ needs.version.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Homebrew formula
+        run: |
+          (cd dist && shasum -a 256 splithello-* > SHA256SUMS)
+          tap="$(brew --repository)/Library/Taps/therealhieu/homebrew-tap"
+          mkdir -p "$tap/Formula"
+          scripts/formula.sh "$V" "file://$PWD/dist" dist/SHA256SUMS > "$tap/Formula/splithello.rb"
+          brew style therealhieu/tap/splithello
+          brew audit therealhieu/tap/splithello
+          brew install therealhieu/tap/splithello
+          brew test therealhieu/tap/splithello
+      - run: cargo publish --dry-run --locked
+
+  publish:
+    needs: [version, build, channels-dry-run]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: cd dist && sha256sum splithello-* > SHA256SUMS
+      # Lets users run `gh attestation verify <archive> --repo therealhieu/splithello`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/splithello-*
+      # A rerun refreshes the assets of a release that already exists.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+          flags=(--title "$GITHUB_REF_NAME" --generate-notes --verify-tag --repo "$GITHUB_REPOSITORY")
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
+
+  homebrew:
+    needs: [version, publish]
+    if: github.ref_type == 'tag' && !contains(github.ref_name, '-')
+    runs-on: macos-15
+    env:
+      V: ${{ needs.version.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --pattern SHA256SUMS --dir dist
+      # The tap's deploy key can write to the tap only; GitHub's host key is pinned.
+      - env:
+          TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          (umask 077 && printf '%s\n' "$TAP_KEY" > "$RUNNER_TEMP/tap_key")
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tap_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          tap="$(brew --repository)/Library/Taps/therealhieu/homebrew-tap"
+          git clone git@github.com:therealhieu/homebrew-tap.git "$tap"
+          scripts/formula.sh "$V" "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" dist/SHA256SUMS > "$tap/Formula/splithello.rb"
+          brew style therealhieu/tap/splithello
+          brew audit --online therealhieu/tap/splithello
+          brew install therealhieu/tap/splithello
+          brew test therealhieu/tap/splithello
+          cd "$tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/splithello.rb
+          git diff --cached --quiet || git commit -m "splithello $V"
+          git push
+
+  crates:
+    needs: [version, publish]
+    if: github.ref_type == 'tag' && !contains(github.ref_name, '-')
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      # crates.io versions are permanent, so a rerun skips a version that is already up.
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if curl -fsS -o /dev/null -A "splithello release (github.com/therealhieu/splithello)" \
+            "https://crates.io/api/v1/crates/splithello/$V"; then
+            echo "splithello $V is already on crates.io"
+            exit 0
+          fi
+          cargo publish --locked
