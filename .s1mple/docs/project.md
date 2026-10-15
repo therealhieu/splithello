@@ -72,19 +72,20 @@ Configuration is fully validated before runtime side effects. Required listeners
 ```text
 CONNECT unselected-host:port
   → OS resolver returns ordered IPv4/IPv6 SocketAddr candidates
-  → connect within one deadline
+  → staggered connect race within one deadline (next candidate every 250 ms or on failure)
   → send 200 only after upstream success
-  → relay both directions unchanged
+  → relay both directions unchanged, one independent loop per direction
 ```
 
-CONNECT-header acquisition, resolution, connection, relay idle time, concurrency, and cancellation are bounded. The authority port must always be listed in validated `proxy.ports`.
+CONNECT-header acquisition, resolution, connection, relay idle time, concurrency, and cancellation are bounded. Both tunnel kinds set `TCP_NODELAY`, and relay byte counts survive idle timeout and cancellation. The authority port must always be listed in validated `proxy.ports`.
 
 ### Selected Tunnel
 
 ```text
 CONNECT selected-host:port
-  → authenticated DoH A query (never OS fallback)
-  → IPv4 origin connection
+  → authenticated DoH A query (never OS fallback); concurrent misses for one host
+    share one query, and startup prewarms each target apex
+  → IPv4 origin connection (same staggered race; resolve + connect share one deadline)
   → send 200
   → buffer one bounded ClientHello
   → require canonical SNI == CONNECT host
