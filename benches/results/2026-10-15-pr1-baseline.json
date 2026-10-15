@@ -1,0 +1,64 @@
+{
+  "commit": "85f1f63",
+  "date": "2026-10-15",
+  "label": "pr1-baseline",
+  "machine": {
+    "cpu": "Apple M1 Max",
+    "os": "macOS 14.4",
+    "rustc": "1.99.0"
+  },
+  "results": {
+    "burst_cold_20": {
+      "ci95_ns": [
+        33187563.0,
+        34450980.0
+      ],
+      "doh_queries_per_burst": 20.0,
+      "median_ns": 33897167.0
+    },
+    "direct_ttfb": {
+      "ci95_ns": [
+        551514.0,
+        593638.0
+      ],
+      "median_ns": 575151.0
+    },
+    "first_request_after_start": {
+      "ci95_ns": [
+        77633521.0,
+        83702177.0
+      ],
+      "median_ns": 81479261.0
+    },
+    "target_cold_ttfb": {
+      "ci95_ns": [
+        23994333.0,
+        25916861.0
+      ],
+      "median_ns": 24891979.0
+    },
+    "target_warm_ttfb": {
+      "ci95_ns": [
+        442565.0,
+        495715.0
+      ],
+      "median_ns": 453867.0
+    },
+    "throughput_bidir_32m": {
+      "ci95_ns": [
+        28209119.0,
+        30941318.0
+      ],
+      "median_ns": 29516413.0,
+      "mib_per_s": 2168.3
+    },
+    "throughput_down_64m": {
+      "ci95_ns": [
+        26641822.0,
+        28622183.0
+      ],
+      "median_ns": 27651241.0,
+      "mib_per_s": 2314.5
+    }
+  }
+}
