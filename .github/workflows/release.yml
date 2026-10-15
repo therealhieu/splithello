@@ -58,6 +58,10 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-2025 }
           - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
     runs-on: ${{ matrix.os }}
+    # Windows runners default to PowerShell, which does not expand `$T`.
+    defaults:
+      run:
+        shell: bash
     env:
       V: ${{ needs.version.outputs.version }}
       T: ${{ matrix.target }}
@@ -73,7 +77,6 @@ jobs:
       - run: cargo build --release --locked --target "$T"
       # Archives hold the binary at the root, where `splithello update` looks for it.
       - name: Smoke test and package
-        shell: bash
         run: |
           exe=splithello
           if [[ "$T" == *windows* ]]; then exe=splithello.exe; fi
