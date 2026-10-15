@@ -44,17 +44,18 @@ scripts/bench.sh snapshot <label>  # record that run in benches/results/ and bel
 Medians; throughput rows show MiB/s.
 
 <!-- results:start -->
-| Scenario | pr1-baseline |
-|---|---|
-| `target_cold_ttfb` | 24.89 ms |
-| `target_warm_ttfb` | 453.9 µs |
-| `direct_ttfb` | 575.2 µs |
-| `burst_cold_20` | 33.90 ms · 20 DoH q |
-| `first_request_after_start` | 81.48 ms |
-| `throughput_down_64m` | 2314 MiB/s |
-| `throughput_bidir_32m` | 2168 MiB/s |
+| Scenario | pr1-baseline | pr2-config |
+|---|---|---|
+| `target_cold_ttfb` | 24.89 ms | 24.72 ms |
+| `target_warm_ttfb` | 453.9 µs | 376.8 µs |
+| `direct_ttfb` | 575.2 µs | 417.6 µs |
+| `burst_cold_20` | 33.90 ms · 20 DoH q | 28.20 ms · 20 DoH q |
+| `first_request_after_start` | 81.48 ms | 75.37 ms |
+| `throughput_down_64m` | 2314 MiB/s | 2841 MiB/s |
+| `throughput_bidir_32m` | 2168 MiB/s | 2264 MiB/s |
 
 | Snapshot | Commit | Date | CPU | OS | rustc |
 |---|---|---|---|---|---|
-| pr1-baseline | `85f1f63` | 2026-10-15 | Apple M1 Max | macOS 14.4 | 1.99.0 |
+| pr1-baseline | `c88e4c9` | 2026-10-15 | Apple M1 Max | macOS 14.4 | 1.99.0 |
+| pr2-config | `94c0b97` | 2026-10-15 | Apple M1 Max | macOS 14.4 | 1.99.0 |
 <!-- results:end -->
