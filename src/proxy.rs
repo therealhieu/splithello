@@ -6,6 +6,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant as StdInstant};
 
 use thiserror::Error;
@@ -23,6 +24,10 @@ use crate::tls::RewriteOutcome;
 
 const MAX_CONNECT_HEADER_BYTES: usize = 65_536;
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+const CONNECT_STAGGER: Duration = Duration::from_millis(250);
+/// Per-direction relay buffer: 8x tokio's `copy` default, so bulk transfers make fewer
+/// read/write syscalls. Costs 128 KiB of heap per open tunnel.
+const RELAY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectRequest {
@@ -335,6 +340,7 @@ impl ProxyServer {
                 accepted = self.listener.accept() => accepted,
             };
             let (client, _) = accepted.map_err(ProxyServiceError::Accept)?;
+            set_nodelay(&client);
             let state = Arc::clone(&self.state);
             let cancel = self.cancel.child_token();
             state.stats.opened();
@@ -451,27 +457,66 @@ pub(crate) struct RelayStats {
     pub(crate) bytes_down: u64,
 }
 
+/// Connects to the first reachable address, Happy-Eyeballs style (RFC 8305 §5): a new
+/// attempt starts every `CONNECT_STAGGER`, or as soon as the previous one fails, and the
+/// first success wins. One blackholed address then costs 250 ms instead of the whole
+/// connect timeout.
 pub(crate) async fn connect_socket_candidates(
     addrs: &[SocketAddr],
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<TcpStream, ConnectError> {
-    for &address in addrs {
-        if Instant::now() >= deadline {
-            return Err(ConnectError::Timeout);
+    race_candidates(addrs, deadline, cancel, TcpStream::connect).await
+}
+
+async fn race_candidates<C, F>(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    cancel: &CancellationToken,
+    connect: C,
+) -> Result<TcpStream, ConnectError>
+where
+    C: Fn(SocketAddr) -> F,
+    F: Future<Output = std::io::Result<TcpStream>> + Send + 'static,
+{
+    let mut candidates = addrs.iter().copied();
+    let mut attempts = JoinSet::new();
+    let mut next_attempt = Instant::now();
+    loop {
+        if attempts.is_empty() || Instant::now() >= next_attempt {
+            match candidates.next() {
+                Some(address) => {
+                    attempts.spawn(connect(address));
+                    next_attempt = Instant::now() + CONNECT_STAGGER;
+                }
+                None if attempts.is_empty() => return Err(ConnectError::Unreachable),
+                None => {}
+            }
         }
-        let attempt = timeout_at(deadline, TcpStream::connect(address));
-        let result = tokio::select! {
+        let more = candidates.len() > 0;
+        tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Err(ConnectError::Cancelled),
-            result = attempt => result,
-        };
-        match result {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(_)) => continue,
-            Err(_) => return Err(ConnectError::Timeout),
+            _ = tokio::time::sleep_until(deadline) => return Err(ConnectError::Timeout),
+            Some(joined) = attempts.join_next() => {
+                if let Ok(Ok(stream)) = joined {
+                    set_nodelay(&stream);
+                    return Ok(stream);
+                }
+                // Failed: start the next candidate now instead of waiting out the stagger.
+                next_attempt = Instant::now();
+            }
+            _ = tokio::time::sleep_until(next_attempt), if more => {}
         }
     }
-    Err(ConnectError::Unreachable)
+}
+
+/// Relayed TLS traffic is latency-bound request/response; Nagle would hold small
+/// records (handshake flights, HTTP/2 frames) for up to one RTT.
+fn set_nodelay(stream: &TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(error = %error, "could not set TCP_NODELAY");
+    }
 }
 
 pub(crate) async fn handle_client(
@@ -566,19 +611,14 @@ async fn handle_client_with_permit(
     };
 
     write_http_status(&mut client, 200, &cancel).await?;
-    let (stats, outcome) = match relay_streams(
+    let (stats, result) = relay_streams(
         &mut client,
         &mut upstream,
         state.limits.idle_timeout,
         &cancel,
     )
-    .await
-    {
-        Ok(stats) => (stats, Outcome::DirectRelay),
-        Err(RelayError::Cancelled) => (RelayStats::default(), Outcome::Cancelled),
-        Err(RelayError::Timeout) => (RelayStats::default(), Outcome::Timeout),
-        Err(RelayError::Io) => (RelayStats::default(), Outcome::ConnectError),
-    };
+    .await;
+    let outcome = result.map_or_else(relay_outcome, |()| Outcome::DirectRelay);
     Ok(report(request, false, outcome, started, stats))
 }
 
@@ -589,6 +629,8 @@ async fn handle_target(
     request: ConnectRequest,
     started: StdInstant,
 ) -> Result<TunnelReport, TunnelError> {
+    // One budget for resolve + connect, as on the direct path.
+    let deadline = Instant::now() + state.limits.connect_timeout;
     let resolve_result = tokio::select! {
         _ = cancel.cancelled() => {
             return Ok(report(
@@ -599,11 +641,11 @@ async fn handle_target(
                 RelayStats::default(),
             ));
         }
-        result = state.target_resolver.resolve_ipv4(request.host()) => result,
+        result = timeout_at(deadline, state.target_resolver.resolve_ipv4(request.host())) => result,
     };
     let ipv4 = match resolve_result {
-        Ok(addresses) => addresses,
-        Err(error) => {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => {
             let _ = write_http_status(&mut client, resolve_status(&error), &cancel).await;
             return Ok(report(
                 request,
@@ -613,12 +655,21 @@ async fn handle_target(
                 RelayStats::default(),
             ));
         }
+        Err(_) => {
+            let _ = write_http_status(&mut client, 504, &cancel).await;
+            return Ok(report(
+                request,
+                true,
+                Outcome::Timeout,
+                started,
+                RelayStats::default(),
+            ));
+        }
     };
     let addresses = ipv4
         .into_iter()
         .map(|address| SocketAddr::from((address, request.port())))
         .collect::<Vec<_>>();
-    let deadline = Instant::now() + state.limits.connect_timeout;
     let mut upstream = match connect_socket_candidates(&addresses, deadline, &cancel).await {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -671,23 +722,17 @@ async fn handle_target(
             RelayStats::default(),
         ));
     }
-    let (mut stats, outcome) = match relay_streams(
+    let (mut stats, result) = relay_streams(
         &mut client,
         &mut upstream,
         state.limits.idle_timeout,
         &cancel,
     )
-    .await
-    {
-        Ok(stats) => (
-            stats,
-            if transformed {
-                Outcome::TargetTransformed
-            } else {
-                Outcome::DirectRelay
-            },
-        ),
-        Err(error) => (RelayStats::default(), relay_outcome(error)),
+    .await;
+    let outcome = match result {
+        Ok(()) if transformed => Outcome::TargetTransformed,
+        Ok(()) => Outcome::DirectRelay,
+        Err(error) => relay_outcome(error),
     };
     stats.bytes_up = stats.bytes_up.saturating_add(prefix_len);
     Ok(report(request, true, outcome, started, stats))
@@ -825,50 +870,98 @@ enum RelayError {
     Io,
 }
 
+/// Relays both directions until each side has sent EOF, or until cancel, an I/O error,
+/// or `idle_timeout` without traffic in either direction.
+///
+/// Each direction runs its own read → write loop, so a slow reader on one side never
+/// stalls traffic the other way. Byte counts are returned even when the relay ends with
+/// an error, so timeouts and cancels still report what was transferred.
 async fn relay_streams(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     idle_timeout: Duration,
     cancel: &CancellationToken,
-) -> Result<RelayStats, RelayError> {
-    let (mut client_read, mut client_write) = client.split();
-    let (mut upstream_read, mut upstream_write) = upstream.split();
-    let mut client_eof = false;
-    let mut upstream_eof = false;
-    let mut up_buffer = [0_u8; 16_384];
-    let mut down_buffer = [0_u8; 16_384];
-    let mut stats = RelayStats::default();
-    let mut idle_deadline = Instant::now() + idle_timeout;
+) -> (RelayStats, Result<(), RelayError>) {
+    let (client_read, client_write) = client.split();
+    let (upstream_read, upstream_write) = upstream.split();
+    let activity = RelayActivity::new();
+    let bytes_up = AtomicU64::new(0);
+    let bytes_down = AtomicU64::new(0);
+    let both_directions = async {
+        tokio::try_join!(
+            relay_direction(client_read, upstream_write, &bytes_up, &activity),
+            relay_direction(upstream_read, client_write, &bytes_down, &activity),
+        )
+    };
+    let result = tokio::select! {
+        _ = cancel.cancelled() => Err(RelayError::Cancelled),
+        () = activity.idle(idle_timeout) => Err(RelayError::Timeout),
+        result = both_directions => result.map(|_| ()),
+    };
+    let stats = RelayStats {
+        bytes_up: bytes_up.into_inner(),
+        bytes_down: bytes_down.into_inner(),
+    };
+    (stats, result)
+}
 
-    while !client_eof || !upstream_eof {
-        tokio::select! {
-            _ = cancel.cancelled() => return Err(RelayError::Cancelled),
-            _ = tokio::time::sleep_until(idle_deadline) => return Err(RelayError::Timeout),
-            result = client_read.read(&mut up_buffer), if !client_eof => {
-                let read = result.map_err(|_| RelayError::Io)?;
-                if read == 0 {
-                    client_eof = true;
-                    upstream_write.shutdown().await.map_err(|_| RelayError::Io)?;
-                } else {
-                    idle_deadline = Instant::now() + idle_timeout;
-                    write_relay_bytes(&mut upstream_write, &up_buffer[..read], idle_deadline, cancel).await?;
-                    stats.bytes_up = stats.bytes_up.saturating_add(read as u64);
-                }
-            }
-            result = upstream_read.read(&mut down_buffer), if !upstream_eof => {
-                let read = result.map_err(|_| RelayError::Io)?;
-                if read == 0 {
-                    upstream_eof = true;
-                    client_write.shutdown().await.map_err(|_| RelayError::Io)?;
-                } else {
-                    idle_deadline = Instant::now() + idle_timeout;
-                    write_relay_bytes(&mut client_write, &down_buffer[..read], idle_deadline, cancel).await?;
-                    stats.bytes_down = stats.bytes_down.saturating_add(read as u64);
-                }
-            }
+async fn relay_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    bytes: &AtomicU64,
+    activity: &RelayActivity,
+) -> Result<(), RelayError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|_| RelayError::Io)?;
+        if read == 0 {
+            return writer.shutdown().await.map_err(|_| RelayError::Io);
+        }
+        activity.touch();
+        writer
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|_| RelayError::Io)?;
+        bytes.fetch_add(read as u64, Ordering::Relaxed);
+        activity.touch();
+    }
+}
+
+/// Last time either relay direction moved bytes, shared by both direction loops and the
+/// idle watchdog. Millisecond resolution is plenty for an idle timeout.
+struct RelayActivity {
+    started: Instant,
+    last_ms: AtomicU64,
+}
+
+impl RelayActivity {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_ms: AtomicU64::new(0),
         }
     }
-    Ok(stats)
+
+    fn touch(&self) {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        self.last_ms.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    /// Completes once no direction has moved bytes for `idle_timeout`.
+    async fn idle(&self, idle_timeout: Duration) {
+        loop {
+            let last = self.started + Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+            let deadline = last + idle_timeout;
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
 }
 
 async fn write_relay_bytes<W: tokio::io::AsyncWrite + Unpin>(
@@ -904,11 +997,7 @@ fn connect_outcome(error: &ConnectError) -> Outcome {
 }
 
 fn resolve_status(error: &ResolveError) -> u16 {
-    if error.is_timeout() {
-        504
-    } else {
-        502
-    }
+    if error.is_timeout() { 504 } else { 502 }
 }
 
 fn report(
@@ -1620,6 +1709,93 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ConnectError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn candidate_connector_races_past_a_blackholed_first_address() {
+        // Loopback answers every SYN, so the blackhole is simulated: a connect to
+        // `blackholed` never completes, as when a SYN is silently dropped.
+        let blackholed = SocketAddr::from(([192, 0, 2, 1], 443));
+        let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let accept = tokio::spawn(async move { live.accept().await.unwrap() });
+        let connect = move |address: SocketAddr| async move {
+            if address == blackholed {
+                std::future::pending::<()>().await;
+            }
+            TcpStream::connect(address).await
+        };
+
+        let started = Instant::now();
+        let stream = super::race_candidates(
+            &[blackholed, live_addr],
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+            connect,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
+        assert!(stream.nodelay().unwrap());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= super::CONNECT_STAGGER && elapsed < Duration::from_secs(1),
+            "second address should start after one stagger, took {elapsed:?}"
+        );
+        accept.await.unwrap();
+    }
+
+    async fn socket_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let (accepted, connected) = tokio::join!(
+            listener.accept(),
+            TcpStream::connect(listener.local_addr().unwrap())
+        );
+        (connected.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn relay_directions_are_independent_and_idle_timeout_keeps_byte_counts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client_peer, mut client) = socket_pair(&listener).await;
+        let (upstream_peer, mut upstream) = socket_pair(&listener).await;
+        let (mut upstream_peer_read, mut upstream_peer_write) = upstream_peer.into_split();
+        let cancel = CancellationToken::new();
+        let relay = tokio::spawn(async move {
+            super::relay_streams(
+                &mut client,
+                &mut upstream,
+                Duration::from_millis(300),
+                &cancel,
+            )
+            .await
+        });
+
+        // The client never reads, so the downstream direction stalls once the socket
+        // buffers fill. Client → upstream bytes must still flow.
+        let _flood = tokio::spawn(async move {
+            let _ = upstream_peer_write.write_all(&vec![0_u8; 32 << 20]).await;
+            upstream_peer_write
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client_peer.write_all(b"ping").await.unwrap();
+        let mut ping = [0_u8; 4];
+        timeout(
+            Duration::from_secs(1),
+            upstream_peer_read.read_exact(&mut ping),
+        )
+        .await
+        .expect("upstream direction must not wait on the stalled downstream write")
+        .unwrap();
+        assert_eq!(&ping, b"ping");
+
+        // Nothing moves any more, so the idle timeout fires and still reports bytes.
+        let (stats, result) = timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Err(super::RelayError::Timeout));
+        assert_eq!(stats.bytes_up, 4);
+        assert!(stats.bytes_down > 0);
     }
 
     #[tokio::test]

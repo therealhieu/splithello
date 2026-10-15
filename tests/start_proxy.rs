@@ -43,6 +43,27 @@ async fn kernel_assigned_proxy_pac_and_origin_ports_are_distinct_and_held() {
 }
 
 #[tokio::test]
+async fn startup_prewarms_each_target_over_doh_before_any_request() {
+    let doh = TestDoh::start(DohResponse::Addresses(vec![Ipv4Addr::LOCALHOST])).await;
+    let origin = TestOrigin::start_ipv4(Vec::new()).await;
+    let mut process = RunningSplitHello::start(TestConfig {
+        doh: &doh,
+        origin_port: origin.addr.port(),
+        target_host: "selected.test",
+        with_pac: false,
+        max_connections: 2,
+        shutdown_seconds: 1,
+        injected_secret: None,
+    });
+
+    doh.wait_for_queries(1).await;
+    assert_eq!(doh.queried_names(), vec!["selected.test".to_owned()]);
+
+    process.signal("INT");
+    assert!(process.wait_for_exit(TEST_TIMEOUT).success());
+}
+
+#[tokio::test]
 async fn ephemeral_listener_runtime_enforces_exact_dynamic_allowed_port() {
     let doh = TestDoh::start(DohResponse::Addresses(vec![Ipv4Addr::LOCALHOST])).await;
     let origin = TestOrigin::start_ipv4(Vec::new()).await;
@@ -69,7 +90,7 @@ async fn ephemeral_listener_runtime_enforces_exact_dynamic_allowed_port() {
             .await,
         0
     );
-    assert!(doh.queries().is_empty());
+    assert_only_prewarm_queries(&doh, "selected.test");
 
     process.signal("INT");
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
@@ -106,10 +127,7 @@ async fn v14_direct_ipv4_and_available_ipv6_relay_are_byte_identical() {
         ipv4.wait_for_connections(1).await,
         vec![b"direct-ipv4".to_vec()]
     );
-    assert!(
-        doh.queries().is_empty(),
-        "direct IPv4 must not use target DoH"
-    );
+    assert_only_prewarm_queries(&doh, "selected.test");
 
     if let Some(ipv6) = TestOrigin::start_ipv6(0, b"ipv6-reply".to_vec()).await {
         let mut ipv6_process = RunningSplitHello::start(TestConfig {
@@ -138,10 +156,7 @@ async fn v14_direct_ipv4_and_available_ipv6_relay_are_byte_identical() {
             ipv6.wait_for_connections(1).await,
             vec![b"direct-ipv6".to_vec()]
         );
-        assert!(
-            doh.queries().is_empty(),
-            "direct IPv6 must not use target DoH"
-        );
+        assert_only_prewarm_queries(&doh, "selected.test");
         ipv6_process.signal("INT");
         assert!(ipv6_process.wait_for_exit(TEST_TIMEOUT).success());
     }
@@ -396,4 +411,14 @@ async fn v19_doh_failure_emits_stable_secret_safe_diagnostic() {
 
     process.signal("INT");
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
+}
+
+/// Startup prewarms the configured target apex; any other name in DoH means a direct or
+/// rejected tunnel leaked its hostname to the target resolver.
+fn assert_only_prewarm_queries(doh: &TestDoh, target: &str) {
+    let names = doh.queried_names();
+    assert!(
+        names.iter().all(|name| name == target),
+        "only the prewarmed target may reach DoH, got {names:?}"
+    );
 }

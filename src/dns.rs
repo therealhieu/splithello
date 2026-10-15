@@ -868,7 +868,9 @@ mod tests {
                         let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
                             continue;
                         };
-                        let head = std::str::from_utf8(&request[..end]).unwrap().to_ascii_lowercase();
+                        let head = std::str::from_utf8(&request[..end])
+                            .unwrap()
+                            .to_ascii_lowercase();
                         let length = head
                             .lines()
                             .find_map(|line| line.strip_prefix("content-length:"))
@@ -885,7 +887,8 @@ mod tests {
                     counter.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
                     let query =
-                        Message::from_vec(&request[header_end..header_end + content_length]).unwrap();
+                        Message::from_vec(&request[header_end..header_end + content_length])
+                            .unwrap();
                     let mut response = Message::new(
                         query.metadata.id,
                         MessageType::Response,
@@ -960,7 +963,11 @@ mod tests {
             follower.await.unwrap().unwrap(),
             vec![Ipv4Addr::new(203, 0, 113, 20)]
         );
-        assert_eq!(queries.load(Ordering::SeqCst), 2, "the follower re-sends the query");
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            2,
+            "the follower re-sends the query"
+        );
         assert!(resolver.in_flight.lock().unwrap().is_empty());
     }
 

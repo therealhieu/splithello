@@ -165,6 +165,21 @@ impl TestDoh {
         self.queries.lock().expect("query lock").clone()
     }
 
+    /// Lower-case names of every query received, without the trailing dot.
+    pub fn queried_names(&self) -> Vec<String> {
+        self.queries()
+            .iter()
+            .flat_map(|message| message.queries.iter())
+            .map(|query| {
+                query
+                    .name()
+                    .to_ascii()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase()
+            })
+            .collect()
+    }
+
     pub async fn wait_for_queries(&self, count: usize) -> Vec<Message> {
         timeout(TEST_TIMEOUT, async {
             loop {
