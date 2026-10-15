@@ -904,7 +904,7 @@ fn connect_outcome(error: &ConnectError) -> Outcome {
 }
 
 fn resolve_status(error: &ResolveError) -> u16 {
-    if matches!(error, ResolveError::Timeout) {
+    if error.is_timeout() {
         504
     } else {
         502

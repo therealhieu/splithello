@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, ConfigError};
 use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
-use crate::domain::DomainError;
+use crate::domain::{DomainError, DomainName};
 use crate::pac::{PacServer, PacServiceError, render_pac};
 use crate::proxy::{ProxyLimits, ProxyServer, ProxyServiceError, ProxyState};
 
@@ -150,7 +150,7 @@ impl Runtime {
         };
         let state = Arc::new(ProxyState::new(
             matcher,
-            target_resolver,
+            target_resolver.clone(),
             config.proxy().allowed_ports().iter().copied(),
             limits,
             config.limits().max_connections(),
@@ -219,6 +219,16 @@ impl Runtime {
             tasks.spawn(async move { pac.run().await.map_err(AppError::from) });
         }
         tasks.spawn(report_summaries(stats, cancel.child_token()));
+        // Detached: it finishes on its own, which `tasks` would read as a stopped service.
+        tokio::spawn(prewarm_targets(
+            target_resolver,
+            config
+                .targets()
+                .iter()
+                .map(|target| target.host().clone())
+                .collect(),
+            cancel.child_token(),
+        ));
 
         Ok(Self {
             cancel,
@@ -279,6 +289,24 @@ async fn report_summaries(
                 }
             }
         }
+    }
+}
+
+/// Resolves every target apex once in the background, so the first browser request
+/// skips the DoH connection setup and lookup. Best effort: failures are logged at DEBUG.
+async fn prewarm_targets(
+    resolver: Arc<DohResolver>,
+    hosts: Vec<DomainName>,
+    cancel: CancellationToken,
+) {
+    let mut lookups = JoinSet::new();
+    for host in hosts {
+        let resolver = resolver.clone();
+        lookups.spawn(async move { resolver.prewarm(&host).await });
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = lookups.join_all() => {}
     }
 }
 

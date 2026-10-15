@@ -19,6 +19,8 @@ use thiserror::Error;
 use crate::{config::DnsConfig, diagnostics::Outcome, domain::DomainName};
 
 const MAX_CNAME_HOPS: usize = 8;
+const DOH_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DOH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DnsAnswer {
@@ -70,13 +72,25 @@ pub(crate) enum ResolveError {
     System(#[source] std::io::Error),
     #[error("operating-system DNS resolution returned no addresses")]
     EmptySystemAnswer,
+    /// A failure of a DoH query that several concurrent lookups shared.
+    #[error(transparent)]
+    Shared(Arc<ResolveError>),
 }
 
 impl ResolveError {
-    pub(crate) const fn outcome(&self) -> Outcome {
+    pub(crate) fn outcome(&self) -> Outcome {
         match self {
             Self::Timeout => Outcome::Timeout,
+            Self::Shared(error) => error.outcome(),
             _ => Outcome::DnsError,
+        }
+    }
+
+    pub(crate) fn is_timeout(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::Shared(error) => error.is_timeout(),
+            _ => false,
         }
     }
 }
@@ -274,10 +288,14 @@ pub(crate) trait TargetResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Addr>, ResolveError>> + Send + 'a>>;
 }
 
+/// One DoH query that concurrent lookups for the same host wait on together.
+type InFlight = Arc<tokio::sync::OnceCell<Result<Vec<Ipv4Addr>, Arc<ResolveError>>>>;
+
 pub(crate) struct DohResolver {
     client: reqwest::Client,
     upstream: reqwest::Url,
     cache: Arc<Mutex<DnsCache>>,
+    in_flight: Mutex<HashMap<DomainName, InFlight>>,
     max_response_bytes: usize,
     next_query_id: AtomicU16,
 }
@@ -292,9 +310,44 @@ impl DohResolver {
                 config.cache_capacity(),
                 config.cache_max_ttl(),
             ))),
+            in_flight: Mutex::new(HashMap::new()),
             max_response_bytes: config.max_response_bytes(),
             next_query_id: AtomicU16::new(0),
         })
+    }
+
+    /// Resolves `host` ahead of the first browser request, so the DoH connection
+    /// (TCP + TLS) is already open and the answer cached. Failures are only logged:
+    /// a later request retries normally.
+    pub(crate) async fn prewarm(&self, host: &DomainName) {
+        let started = Instant::now();
+        match self.resolve_ipv4(host).await {
+            Ok(addrs) => tracing::debug!(
+                host = %host,
+                addresses = addrs.len(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                "DoH prewarmed"
+            ),
+            Err(error) => tracing::debug!(host = %host, error = %error, "DoH prewarm failed"),
+        }
+    }
+
+    fn cached(&self, host: &DomainName) -> Result<Option<Vec<Ipv4Addr>>, ResolveError> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| ResolveError::CacheUnavailable)?
+            .get(host, Instant::now()))
+    }
+
+    /// Queries DoH and caches a success. Runs once per in-flight host.
+    async fn query_and_cache(&self, host: &DomainName) -> Result<Vec<Ipv4Addr>, ResolveError> {
+        let answer = self.query_a(host).await?;
+        self.cache
+            .lock()
+            .map_err(|_| ResolveError::CacheUnavailable)?
+            .insert(host.clone(), &answer, Instant::now());
+        Ok(answer.addrs)
     }
 
     async fn query_a(&self, host: &DomainName) -> Result<DnsAnswer, ResolveError> {
@@ -350,22 +403,39 @@ impl TargetResolver for DohResolver {
         host: &'a DomainName,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Addr>, ResolveError>> + Send + 'a>> {
         Box::pin(async move {
-            if let Some(cached) = self
-                .cache
-                .lock()
-                .map_err(|_| ResolveError::CacheUnavailable)?
-                .get(host, Instant::now())
-            {
+            if let Some(cached) = self.cached(host)? {
                 return Ok(cached);
             }
 
-            let answer = self.query_a(host).await?;
-            let addrs = answer.addrs.clone();
-            self.cache
+            // Single flight: a page load opens many tunnels to one new host at once;
+            // they share one DoH query instead of racing N identical ones. If the
+            // querying tunnel is dropped, `OnceCell` lets a waiting one take over.
+            let flight = self
+                .in_flight
                 .lock()
                 .map_err(|_| ResolveError::CacheUnavailable)?
-                .insert(host.clone(), &answer, Instant::now());
-            Ok(addrs)
+                .entry(host.clone())
+                .or_default()
+                .clone();
+            let result = flight
+                .get_or_init(|| async { self.query_and_cache(host).await.map_err(Arc::new) })
+                .await
+                .clone();
+            {
+                let mut in_flight = self
+                    .in_flight
+                    .lock()
+                    .map_err(|_| ResolveError::CacheUnavailable)?;
+                if in_flight
+                    .get(host)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                {
+                    in_flight.remove(host);
+                }
+            }
+            drop(flight);
+            // A lone lookup gets its original error back; shared failures stay shared.
+            result.map_err(|error| Arc::try_unwrap(error).unwrap_or_else(ResolveError::Shared))
         })
     }
 }
@@ -381,7 +451,12 @@ fn build_authenticated_client(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .connect_timeout(timeout)
-        .read_timeout(timeout);
+        .read_timeout(timeout)
+        // Keep the one DoH connection warm between page loads: a cold one costs a TCP +
+        // TLS handshake (~100-200 ms to a public resolver) before the first lookup.
+        .pool_idle_timeout(DOH_POOL_IDLE_TIMEOUT)
+        .http2_keep_alive_interval(DOH_KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_while_idle(true);
     if let Some(pem) = additional_ca_pem {
         let certificates = reqwest::tls::Certificate::from_pem_bundle(pem)
             .map_err(|_| ResolveError::InvalidCaCertificate)?;
@@ -448,7 +523,10 @@ fn validate_message_identity(
 mod tests {
     use std::{
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -736,6 +814,7 @@ mod tests {
             client: build_test_client(),
             upstream: reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap(),
             cache: Arc::new(Mutex::new(DnsCache::new(4, Duration::from_secs(60)))),
+            in_flight: Mutex::default(),
             max_response_bytes: 4096,
             next_query_id: std::sync::atomic::AtomicU16::new(11),
         };
@@ -766,6 +845,125 @@ mod tests {
         );
     }
 
+    /// A DoH server that answers every query with 203.0.113.20 after `delay`, one
+    /// query per connection, and counts the queries it receives.
+    async fn counting_doh(delay: Duration) -> (reqwest::Url, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&queries);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let (header_end, content_length) = loop {
+                        let mut chunk = [0_u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = std::str::from_utf8(&request[..end]).unwrap().to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map(|value| value.trim().parse::<usize>().unwrap())
+                            .unwrap();
+                        break (end + 4, length);
+                    };
+                    while request.len() < header_end + content_length {
+                        let mut chunk = [0_u8; 1024];
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0);
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    let query =
+                        Message::from_vec(&request[header_end..header_end + content_length]).unwrap();
+                    let mut response = Message::new(
+                        query.metadata.id,
+                        MessageType::Response,
+                        hickory_proto::op::OpCode::Query,
+                    );
+                    response
+                        .add_query(query.queries[0].clone())
+                        .add_answer(Record::from_rdata(
+                            query.queries[0].name().clone(),
+                            30,
+                            RData::A(A::new(203, 0, 113, 20)),
+                        ));
+                    let body = response.to_vec().unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    // The client may have given up already; that is part of some tests.
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        let upstream = reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap();
+        (upstream, queries)
+    }
+
+    fn counting_resolver(upstream: reqwest::Url) -> Arc<DohResolver> {
+        Arc::new(DohResolver {
+            client: build_test_client(),
+            upstream,
+            cache: Arc::new(Mutex::new(DnsCache::new(4, Duration::from_secs(60)))),
+            in_flight: Mutex::default(),
+            max_response_bytes: 4096,
+            next_query_id: std::sync::atomic::AtomicU16::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_for_one_host_share_one_doh_query() {
+        let (upstream, queries) = counting_doh(Duration::from_millis(100)).await;
+        let resolver = counting_resolver(upstream);
+        let mut lookups = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let resolver = Arc::clone(&resolver);
+            lookups.spawn(async move { resolver.resolve_ipv4(&host("reddit.com")).await });
+        }
+        for result in lookups.join_all().await {
+            assert_eq!(result.unwrap(), vec![Ipv4Addr::new(203, 0, 113, 20)]);
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert!(resolver.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waiting_lookup_takes_over_when_the_querying_lookup_is_dropped() {
+        let (upstream, queries) = counting_doh(Duration::from_millis(300)).await;
+        let resolver = counting_resolver(upstream);
+        let leader = {
+            let resolver = Arc::clone(&resolver);
+            tokio::spawn(async move { resolver.resolve_ipv4(&host("reddit.com")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let follower = {
+            let resolver = Arc::clone(&resolver);
+            tokio::spawn(async move { resolver.resolve_ipv4(&host("reddit.com")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader.abort();
+
+        assert_eq!(
+            follower.await.unwrap().unwrap(),
+            vec![Ipv4Addr::new(203, 0, 113, 20)]
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 2, "the follower re-sends the query");
+        assert!(resolver.in_flight.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn doh_does_not_follow_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -785,6 +983,7 @@ mod tests {
             client: build_test_client(),
             upstream: reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap(),
             cache: Arc::new(Mutex::new(DnsCache::new(1, Duration::from_secs(60)))),
+            in_flight: Mutex::default(),
             max_response_bytes: 4096,
             next_query_id: std::sync::atomic::AtomicU16::new(0),
         };
@@ -814,6 +1013,7 @@ mod tests {
             client: build_test_client(),
             upstream: reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap(),
             cache: Arc::new(Mutex::new(DnsCache::new(1, Duration::from_secs(60)))),
+            in_flight: Mutex::default(),
             max_response_bytes: 64,
             next_query_id: std::sync::atomic::AtomicU16::new(0),
         };
@@ -848,6 +1048,7 @@ mod tests {
             client: build_test_client(),
             upstream: reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap(),
             cache: Arc::new(Mutex::new(DnsCache::new(1, Duration::from_secs(60)))),
+            in_flight: Mutex::default(),
             max_response_bytes: 64,
             next_query_id: std::sync::atomic::AtomicU16::new(0),
         };
