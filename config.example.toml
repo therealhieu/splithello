@@ -1,9 +1,11 @@
 # SplitHello configuration. Only `targets` is required; every other value shown is the
-# default. `splithello init` writes this file; `splithello check` validates it.
+# default. `splithello start` writes this file when none exists.
 
 # Sites that use DoH + ClientHello splitting. A plain host also covers its subdomains;
 # use { host = "example.com", subdomains = false } to match one exact host.
-targets = ["reddit.com", "medium.com"]
+# SplitHello will not start until at least one site is listed, for example:
+# targets = ["reddit.com", "medium.com"]
+targets = []
 
 [proxy]
 listen = "127.0.0.1:8080" # browser HTTPS proxy address

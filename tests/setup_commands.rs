@@ -23,41 +23,71 @@ fn text(output: &Output) -> String {
     )
 }
 
-#[test]
-fn init_writes_the_example_to_the_default_path_and_refuses_to_overwrite() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("splithello/config.toml");
+const EXAMPLE: &str = include_str!("../config.example.toml");
 
-    let first = splithello(&["init"], home.path());
-    assert!(first.status.success(), "{}", text(&first));
-    assert!(text(&first).contains(&path.display().to_string()));
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.toml")).unwrap()
+/// `start` on a missing file writes the starter there, then stops because it has no targets.
+fn assert_creates_starter_and_stops(output: &Output, path: &std::path::Path) {
+    let printed = text(output);
+    assert!(!output.status.success(), "{printed}");
+    assert_eq!(fs::read_to_string(path).unwrap(), EXAMPLE);
+    let shown = path.display().to_string();
+    assert!(
+        printed.contains(&format!("created starter configuration {shown}")),
+        "{printed}"
     );
-
-    fs::write(&path, "targets = [\"edited.example\"]\n").unwrap();
-    let second = splithello(&["init"], home.path());
-    assert!(!second.status.success());
-    assert!(text(&second).contains("already exists; pass --force"));
-    assert_eq!(
-        fs::read_to_string(&path).unwrap(),
-        "targets = [\"edited.example\"]\n"
+    assert!(
+        printed.contains(&format!("no targets in {shown}")),
+        "{printed}"
     );
-
-    let forced = splithello(&["init", "--force"], home.path());
-    assert!(forced.status.success(), "{}", text(&forced));
-    assert!(fs::read_to_string(&path).unwrap().contains("reddit.com"));
+    assert!(!printed.contains("SplitHello is ready"), "{printed}");
 }
 
 #[test]
-fn start_without_a_config_points_at_init() {
+fn start_creates_the_default_config_and_stops_without_targets() {
     let home = tempfile::tempdir().unwrap();
     let output = splithello(&["start"], home.path());
+    assert_creates_starter_and_stops(&output, &home.path().join("splithello/config.toml"));
+}
+
+#[test]
+fn start_creates_an_explicit_config_path_and_stops_without_targets() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("nested/dir/custom.toml");
+    let output = splithello(
+        &["start", "--config", &path.display().to_string()],
+        home.path(),
+    );
+    assert_creates_starter_and_stops(&output, &path);
+    assert!(!home.path().join("splithello/config.toml").exists());
+}
+
+#[test]
+fn an_existing_config_is_never_overwritten() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("splithello/config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "targets = []\n# edited\n").unwrap();
+
+    let output = splithello(&["check"], home.path());
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(
+        !printed.contains("created starter configuration"),
+        "{printed}"
+    );
+    assert!(printed.contains("no targets in"), "{printed}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "targets = []\n# edited\n"
+    );
+}
+
+#[test]
+fn init_is_no_longer_a_command() {
+    let home = tempfile::tempdir().unwrap();
+    let output = splithello(&["init"], home.path());
     assert!(!output.status.success());
-    let output = text(&output);
-    assert!(output.contains("outcome=config-error"), "{output}");
-    assert!(output.contains("run `splithello init`"), "{output}");
+    assert!(!home.path().join("splithello/config.toml").exists());
 }
 
 async fn check_against(response: DohResponse) -> (Output, tempfile::TempDir) {

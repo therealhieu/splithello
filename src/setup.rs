@@ -1,7 +1,7 @@
-//! `splithello init` and `splithello check`: one-shot commands that never start services.
+//! Starter-config creation and `splithello check`: one-shot steps that never start services.
 
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Instant;
@@ -13,25 +13,28 @@ use crate::dns::{DohResolver, TargetResolver};
 /// The repository example doubles as the starter file, so the two cannot drift.
 const TEMPLATE: &str = include_str!("../config.example.toml");
 
-pub(crate) fn init(path: &Path, force: bool) -> Result<(), AppError> {
-    if path.exists() && !force {
-        return Err(AppError::InitExists {
-            path: path.to_path_buf(),
-        });
-    }
+/// Writes the starter configuration to `path` unless a file is already there, and returns
+/// whether it did. `create_new` makes the existence check and the write one step, so an
+/// existing file is never overwritten.
+pub(crate) fn ensure_config(path: &Path) -> Result<bool, AppError> {
     let write = |path: &Path| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, TEMPLATE)
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?
+            .write_all(TEMPLATE.as_bytes())
     };
-    write(path).map_err(|source| AppError::InitWrite {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    println!("wrote {}", path.display());
-    println!("next: edit `targets`, then run `splithello check` and `splithello start`");
-    Ok(())
+    match write(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(source) => Err(AppError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Prints the effective configuration and probes what `start` depends on.

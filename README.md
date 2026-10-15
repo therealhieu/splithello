@@ -6,33 +6,36 @@ Inspired by [tuananh/dpi-bypass](https://github.com/tuananh/dpi-bypass).
 
 ## Run
 
-Build, create a config, check it, and start:
+1. Build and start. The first run creates `~/.config/splithello/config.toml` and stops.
+
+   ```sh
+   cargo build --release
+   ./target/release/splithello start
+   ```
+
+2. Add your sites to that file, then run `./target/release/splithello start` again.
+
+   ```toml
+   targets = ["reddit.com", "medium.com"]   # subdomains included
+   ```
+
+3. Set your browser's HTTPS proxy to `127.0.0.1:8080`, or its PAC URL to `http://127.0.0.1:8081/proxy.pac`.
+
+Keep it running while you browse. A ready banner (`outcome=ready` when piped) means it started.
+
+To use another file instead of `~/.config/splithello/config.toml`, pass `--config <PATH>`:
 
 ```sh
-cargo build --release
-./target/release/splithello init    # writes ~/.config/splithello/config.toml
-./target/release/splithello check   # validates it, checks listeners, resolves each target over DoH
-./target/release/splithello start
+./target/release/splithello start --config config.example.toml
 ```
 
-`init` writes [`config.example.toml`](config.example.toml); the only required key is the target list:
+| File at `<PATH>` | Result |
+|---|---|
+| has targets | starts |
+| missing | creates it, then stops |
+| `targets = []` | stops with a warning |
 
-```toml
-targets = ["reddit.com", "medium.com"]   # a plain host also covers its subdomains
-```
-
-Every command accepts `--config <PATH>` to use another file, for example
-`./target/release/splithello start --config config.example.toml`. Without it, SplitHello reads
-`$XDG_CONFIG_HOME/splithello/config.toml`, falling back to `~/.config/splithello/config.toml`.
-
-Configure your browser or operating system with one option:
-
-- HTTPS proxy: `127.0.0.1:8080`
-- PAC URL: `http://127.0.0.1:8081/proxy.pac`
-
-Then open a configured target such as `https://www.reddit.com/`.
-
-A successful start prints a ready banner (`outcome=ready` when logs are piped). Keep the process running while browsing.
+An existing file is never overwritten.
 
 ### Logs
 

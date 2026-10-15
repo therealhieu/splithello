@@ -10,12 +10,12 @@ mod proxy;
 mod setup;
 mod tls;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use app::{AppError, Runtime};
 use clap::Parser;
 use cli::{Cli, Command, ConfigArgs};
-use config::Config;
+use config::{Config, ConfigError};
 
 #[tokio::main]
 async fn main() {
@@ -36,21 +36,25 @@ async fn main() {
     }
 }
 
-/// Returns `Ok(false)` when a command finished but reported failures (`check`).
+/// Returns `Ok(false)` when a command finished but reported failures (`check`) or stopped
+/// before doing anything because no targets are configured.
 async fn run(cli: Cli) -> Result<bool, AppError> {
     match cli.command {
         Command::Start(args) => {
-            let config = Config::load(&config_path(&args)?)?;
+            let Some(config) = load_config(&config_path(&args)?)? else {
+                return Ok(false);
+            };
             let mut runtime = Runtime::start(config).await?;
             runtime.ready().emit();
             let run_result = runtime.run_until_signal().await;
             let shutdown_result = runtime.shutdown().await;
             run_result.and(shutdown_result).map(|()| true)
         }
-        Command::Init(args) => setup::init(&config_path(&args.config)?, args.force).map(|()| true),
         Command::Check(args) => {
             let path = config_path(&args)?;
-            let config = Config::load(&path)?;
+            let Some(config) = load_config(&path)? else {
+                return Ok(false);
+            };
             setup::check(&path, &config).await
         }
     }
@@ -58,4 +62,24 @@ async fn run(cli: Cli) -> Result<bool, AppError> {
 
 fn config_path(args: &ConfigArgs) -> Result<PathBuf, AppError> {
     args.path().ok_or(AppError::NoConfigPath)
+}
+
+/// Writes the starter file if `path` is missing, then loads it. Returns `None` after a
+/// warning when no targets are configured, which is the starter file's state.
+fn load_config(path: &Path) -> Result<Option<Config>, AppError> {
+    if setup::ensure_config(path)? {
+        tracing::info!("created starter configuration {}", path.display());
+    }
+    match Config::load(path) {
+        Ok(config) => Ok(Some(config)),
+        Err(ConfigError::EmptyTargets) => {
+            tracing::warn!(
+                "no targets in {}; add sites to `targets`, for example \
+                 targets = [\"reddit.com\", \"medium.com\"], then run this command again",
+                path.display()
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
