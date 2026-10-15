@@ -71,6 +71,16 @@ impl ReadyMetadata {
 pub(crate) enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error("could not determine a configuration path; set HOME or pass --config <PATH>")]
+    NoConfigPath,
+    #[error("{} already exists; pass --force to overwrite it", path.display())]
+    InitExists { path: std::path::PathBuf },
+    #[error("could not write {}: {source}", path.display())]
+    InitWrite {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not construct authenticated target resolver")]
     Resolver(#[source] ResolveError),
     #[error("could not compile target policy")]
@@ -104,7 +114,8 @@ pub(crate) enum AppError {
 impl AppError {
     pub(crate) const fn outcome(&self) -> Outcome {
         match self {
-            Self::Config(_) => Outcome::ConfigError,
+            Self::Config(_) | Self::NoConfigPath | Self::InitExists { .. } => Outcome::ConfigError,
+            Self::InitWrite { .. } => Outcome::InternalError,
             Self::Resolver(_) => Outcome::DnsError,
             Self::Domain(_) => Outcome::ConfigError,
             Self::ProxyBind { .. }
@@ -319,11 +330,9 @@ mod tests {
     use super::{AppError, Runtime, drain_tasks};
 
     fn config_text(proxy: &str, pac: Option<&str>, shutdown_seconds: u64) -> String {
-        let pac = pac
-            .map(|address| format!("pac_listen = \"{address}\"\n"))
-            .unwrap_or_default();
+        let pac = pac.map_or_else(|| "false".to_owned(), |address| format!("\"{address}\""));
         format!(
-            "[proxy]\nlisten = \"{proxy}\"\n{pac}\n[dns]\nupstream = \"https://1.1.1.1/dns-query\"\n\n[limits]\nshutdown_timeout_seconds = {shutdown_seconds}\n\n[[targets]]\nhost = \"reddit.com\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n"
+            "targets = [\"reddit.com\"]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\n\n[limits]\nshutdown_timeout = \"{shutdown_seconds}s\"\n"
         )
     }
 

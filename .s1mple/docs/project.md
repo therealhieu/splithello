@@ -23,8 +23,8 @@ The proxy preserves browser-to-origin TLS. It does not terminate TLS, install ce
 |---|---|---|
 | Rust | Application language | Edition 2024 in [Cargo.toml](../../Cargo.toml) |
 | Tokio / tokio-util | Async TCP, task ownership, cancellation, timeouts, and signals | [Cargo.toml](../../Cargo.toml) |
-| clap | Exact `start --config <PATH>` CLI | [Cargo.toml](../../Cargo.toml), [`src/cli.rs`](../../src/cli.rs) |
-| Serde / TOML / IDNA | Strict configuration and canonical domain values | [Cargo.toml](../../Cargo.toml), [`src/config.rs`](../../src/config.rs), [`src/domain.rs`](../../src/domain.rs) |
+| clap | `start`, `init`, `check` CLI with optional `--config <PATH>` | [Cargo.toml](../../Cargo.toml), [`src/cli.rs`](../../src/cli.rs) |
+| Serde / TOML / humantime / IDNA | Strict configuration, human durations, canonical domain values | [Cargo.toml](../../Cargo.toml), [`src/config.rs`](../../src/config.rs), [`src/domain.rs`](../../src/domain.rs) |
 | reqwest + rustls / hickory-proto | Authenticated RFC 8484 DoH and DNS wire messages | [Cargo.toml](../../Cargo.toml), [`src/dns.rs`](../../src/dns.rs) |
 | thiserror / tracing | Structured errors and stable secret-safe diagnostics | [Cargo.toml](../../Cargo.toml), [`src/diagnostics.rs`](../../src/diagnostics.rs) |
 | rcgen / tokio-rustls | Dev-only authenticated local DoH test boundary | [Cargo.toml](../../Cargo.toml), [`tests/support/mod.rs`](../../tests/support/mod.rs) |
@@ -36,8 +36,9 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 | Path | Responsibility |
 |---|---|
 | [`src/main.rs`](../../src/main.rs) | Tracing initialization, CLI dispatch, validated configuration, runtime lifecycle, process exit mapping |
-| [`src/cli.rs`](../../src/cli.rs) | Stable `splithello start --config <PATH>` command contract |
-| [`src/config.rs`](../../src/config.rs) | Strict TOML schema, defaults, hard bounds, loopback and safe-port validation |
+| [`src/cli.rs`](../../src/cli.rs) | `start` / `init` / `check` commands and the per-user default config path |
+| [`src/config.rs`](../../src/config.rs) | Strict TOML schema (only `targets` required), defaults, hard bounds, loopback and safe-port validation |
+| [`src/setup.rs`](../../src/setup.rs) | `init` (writes the example) and `check` (config summary, listener and DoH probes) |
 | [`src/domain.rs`](../../src/domain.rs) | Canonical IDNA domain names and exact/label-aware target matching |
 | [`src/dns.rs`](../../src/dns.rs) | Target-only IPv4 DoH resolver, DNS validation, TTL cache, and direct OS resolver |
 | [`src/tls.rs`](../../src/tls.rs) | Bounded ClientHello parser and byte-preserving SNI-internal record split |
@@ -45,7 +46,8 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 | [`src/pac.rs`](../../src/pac.rs) | Deterministic target-only PAC rendering and bounded PAC service |
 | [`src/app.rs`](../../src/app.rs) | Atomic listener binding, shared composition, readiness, signals, cancellation, and bounded shutdown |
 | [`src/diagnostics.rs`](../../src/diagnostics.rs) | Stable outcome vocabulary and secret-safe tunnel reports |
-| [`config.example.toml`](../../config.example.toml) | Valid fixed-loopback Reddit/Medium operating example |
+| [`config.example.toml`](../../config.example.toml) | Valid fixed-loopback Reddit/Medium example; also the `init` template |
+| [`benches/proxy.rs`](../../benches/proxy.rs) | End-to-end benchmarks; paired base-vs-HEAD gate via [`scripts/bench.sh`](../../scripts/bench.sh) ([results](../../benches/BASELINE.md)) |
 | [`README.md`](../../README.md) | Build, setup, diagnostics, limitations, DoH bootstrap rule, and rollback |
 | [`tests/start_proxy.rs`](../../tests/start_proxy.rs) | Compiled-binary V14–V19 integration scenarios and port-boundary regression |
 | [`tests/support/mod.rs`](../../tests/support/mod.rs) | Generated-CA DoH, origins, process harness, CONNECT/PAC clients, deadlines, and cleanup |
@@ -55,7 +57,7 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 ### Startup and Shutdown
 
 ```text
-CLI parse → Config::load and validate
+CLI parse → resolve --config or default path → Config::load and validate
           → construct matcher/resolvers/semaphore
           → atomically bind proxy and optional PAC listeners
           → spawn tracked services → emit outcome=ready
@@ -74,7 +76,7 @@ CONNECT unselected-host:port
   → relay both directions unchanged
 ```
 
-CONNECT-header acquisition, resolution, connection, relay idle time, concurrency, and cancellation are bounded. The authority port must always be listed in validated `allowed_ports`.
+CONNECT-header acquisition, resolution, connection, relay idle time, concurrency, and cancellation are bounded. The authority port must always be listed in validated `proxy.ports`.
 
 ### Selected Tunnel
 
@@ -95,7 +97,7 @@ The transformed records preserve the exact ClientHello handshake byte sequence. 
 
 | Contract | Required behavior |
 |---|---|
-| `Config` | Reject unknown fields, unsafe limits, non-loopback listeners, invalid DoH, invalid/additional CA material, duplicate targets, and unlisted CONNECT ports before startup |
+| `Config` | Only `targets` is required (`"host"` covers subdomains; `{ host, subdomains = false }` is exact). Durations are humantime strings. Reject unknown fields, unsafe limits, non-loopback listeners, invalid DoH, invalid/additional CA material, duplicate targets, and unlisted CONNECT ports before startup |
 | `DomainName` / `TargetMatcher` | Canonical lowercase ASCII/IDNA identity; complete-label exact and explicit subdomain matching; no suffix overmatch |
 | `TargetResolver` | Selected hosts return validated IPv4 A candidates from authenticated DoH only |
 | `SystemResolver` | Unselected hosts retain normal ordered IPv4/IPv6 operating-system candidates |
@@ -103,18 +105,20 @@ The transformed records preserve the exact ClientHello handshake byte sequence. 
 | `Outcome` / `TunnelReport` | Stable categories and bounded metadata; no raw headers, DNS messages, ClientHello bytes, credentials, cookies, or application payloads |
 | PAC | Exact configured hosts and enabled subdomains use `PROXY`; all others use `DIRECT` |
 
-The scoped loopback port-0 mode exists for deterministic integration tests. It allows explicit nonstandard ports to be listed for test origins, but CONNECT parsing still requires exact membership in `allowed_ports`. Normal nonzero listener configurations remain limited to ports 443 and 8443.
+The scoped loopback port-0 mode exists for deterministic integration tests. It allows explicit nonstandard ports to be listed for test origins, but CONNECT parsing still requires exact membership in `proxy.ports`. Normal nonzero listener configurations remain limited to ports 443 and 8443.
 
 ## Operating Contract
 
-Build and start:
+Build, create a config, check it, and start:
 
 ```sh
 cargo build --release
-./target/release/splithello start --config config.example.toml
+./target/release/splithello init    # $XDG_CONFIG_HOME or ~/.config /splithello/config.toml
+./target/release/splithello check
+./target/release/splithello start   # or: start --config config.example.toml
 ```
 
-The shipped example uses:
+The shipped example (all values are the defaults) uses:
 
 - proxy `127.0.0.1:8080`;
 - PAC `http://127.0.0.1:8081/proxy.pac`;

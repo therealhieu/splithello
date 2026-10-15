@@ -6,12 +6,24 @@ Inspired by [tuananh/dpi-bypass](https://github.com/tuananh/dpi-bypass).
 
 ## Run
 
-Build and start:
+Build, create a config, check it, and start:
 
 ```sh
 cargo build --release
-./target/release/splithello start --config config.example.toml
+./target/release/splithello init    # writes ~/.config/splithello/config.toml
+./target/release/splithello check   # validates it, checks listeners, resolves each target over DoH
+./target/release/splithello start
 ```
+
+`init` writes [`config.example.toml`](config.example.toml); the only required key is the target list:
+
+```toml
+targets = ["reddit.com", "medium.com"]   # a plain host also covers its subdomains
+```
+
+Every command accepts `--config <PATH>` to use another file, for example
+`./target/release/splithello start --config config.example.toml`. Without it, SplitHello reads
+`$XDG_CONFIG_HOME/splithello/config.toml`, falling back to `~/.config/splithello/config.toml`.
 
 Configure your browser or operating system with one option:
 
@@ -54,7 +66,7 @@ Browser                 SplitHello              DoH Server       Website
    │◄════════════ encrypted HTTPS through SplitHello ════════════════►│
 ```
 
-Targets are defined in `config.example.toml`. The example includes `reddit.com`, `medium.com`, and their subdomains. The PAC file sends only those targets through SplitHello.
+Targets are defined by `targets` in the config. The example includes `reddit.com`, `medium.com`, and their subdomains; `{ host = "example.com", subdomains = false }` matches one exact host. The PAC file sends only those targets through SplitHello.
 
 The DoH endpoint host must be bootstrap-reachable without resolving any configured selected or blocked domain. Prefer a literal-IP HTTPS endpoint whose certificate is valid for that IP, or an independently resolvable non-target hostname. HTTPS certificate authentication is mandatory. `dns.ca_certificate` may add trusted CA roots but never disables verification.
 

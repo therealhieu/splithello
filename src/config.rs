@@ -1,27 +1,31 @@
 use std::{
     collections::HashSet,
-    fs,
+    fmt, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 use crate::domain::{DomainError, DomainName, TargetMatcher, TargetRule};
 
-const DEFAULT_ALLOWED_PORTS: &[u16] = &[443];
+const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
+const DEFAULT_PAC_LISTEN: &str = "127.0.0.1:8081";
+const DEFAULT_DOH_UPSTREAM: &str = "https://1.1.1.1/dns-query";
+const DEFAULT_PORTS: &[u16] = &[443];
 const SAFE_CONNECT_PORTS: &[u16] = &[443, 8443];
 const MAX_CONNECT_HEADER_BYTES: usize = 65_536;
 const MAX_CLIENT_HELLO_BYTES: usize = 1_048_576;
 const MAX_CONNECTIONS: usize = 4_096;
 const MAX_DNS_RESPONSE_BYTES: usize = 1_048_576;
-const MAX_DNS_CACHE_CAPACITY: usize = 4_096;
-const MAX_TIMEOUT_SECONDS: u64 = 300;
-const MAX_SHUTDOWN_SECONDS: u64 = 60;
-const MAX_CACHE_TTL_SECONDS: u64 = 86_400;
+const MAX_DNS_CACHE_SIZE: usize = 4_096;
+const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CACHE_TTL: Duration = Duration::from_secs(86_400);
 
 // These validated contracts are consumed incrementally by later implementation groups.
 #[allow(dead_code)]
@@ -91,15 +95,16 @@ pub(crate) struct RuntimeLimits {
     shutdown_timeout: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Strategy {
     TlsRecordSplit,
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
-    #[error("could not read configuration {path}: {source}")]
+    #[error("no configuration at {}; run `splithello init` to create one", path.display())]
+    NotFound { path: PathBuf },
+    #[error("could not read configuration {}: {source}", path.display())]
     Read {
         path: PathBuf,
         #[source]
@@ -107,13 +112,13 @@ pub(crate) enum ConfigError {
     },
     #[error("invalid TOML configuration: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error("invalid proxy listener `{value}`")]
+    #[error("invalid listener address `{value}`")]
     InvalidListener { value: String },
-    #[error("proxy listener must be loopback: {address}")]
+    #[error("listener must be loopback: {address}")]
     NonLoopbackListener { address: SocketAddr },
-    #[error("proxy and PAC listeners must use different addresses")]
+    #[error("proxy.listen and proxy.pac must use different addresses")]
     ListenerConflict,
-    #[error("allowed_ports must not be empty")]
+    #[error("proxy.ports must not be empty")]
     EmptyAllowedPorts,
     #[error("CONNECT port {port} is not approved; allowed values are 443 and 8443")]
     UnsafePort { port: u16 },
@@ -125,13 +130,13 @@ pub(crate) enum ConfigError {
     InsecureDohUrl,
     #[error("DoH upstream must not contain credentials or a fragment")]
     UnsafeDohUrl,
-    #[error("could not read additional CA certificate {path}: {source}")]
+    #[error("could not read additional CA certificate {}: {source}", path.display())]
     ReadCaCertificate {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("additional CA certificate {path} is not valid PEM")]
+    #[error("additional CA certificate {} is not valid PEM", path.display())]
     InvalidCaCertificate { path: PathBuf },
     #[error("at least one target is required")]
     EmptyTargets,
@@ -144,49 +149,96 @@ pub(crate) enum ConfigError {
         max: u64,
         actual: u64,
     },
+    #[error(
+        "{field} must be greater than 0 and at most {}, got {}",
+        humantime::format_duration(*max),
+        humantime::format_duration(*actual)
+    )]
+    DurationOutOfBounds {
+        field: &'static str,
+        max: Duration,
+        actual: Duration,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    targets: Vec<RawTarget>,
+    #[serde(default)]
     proxy: RawProxyConfig,
+    #[serde(default)]
     dns: RawDnsConfig,
     #[serde(default)]
     limits: RawRuntimeLimits,
-    targets: Vec<RawTargetConfig>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct RawProxyConfig {
     listen: String,
-    pac_listen: Option<String>,
-    #[serde(default = "default_allowed_ports")]
-    allowed_ports: Vec<u16>,
+    pac: RawPac,
+    ports: Vec<u16>,
+}
+
+impl Default for RawProxyConfig {
+    fn default() -> Self {
+        Self {
+            listen: DEFAULT_LISTEN.to_owned(),
+            pac: RawPac::Enabled(true),
+            ports: DEFAULT_PORTS.to_vec(),
+        }
+    }
+}
+
+/// `pac = "127.0.0.1:8081"` sets the PAC listener, `pac = false` disables it,
+/// `pac = true` (the default) uses the default address.
+#[derive(Debug)]
+enum RawPac {
+    Enabled(bool),
+    Address(String),
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct RawDnsConfig {
     upstream: String,
     ca_certificate: Option<PathBuf>,
-    #[serde(default = "default_dns_timeout_seconds")]
-    timeout_seconds: u64,
-    #[serde(default = "default_cache_max_ttl_seconds")]
-    cache_max_ttl_seconds: u64,
-    #[serde(default = "default_cache_capacity")]
-    cache_capacity: usize,
-    #[serde(default = "default_dns_response_bytes")]
+    #[serde(deserialize_with = "human_duration")]
+    timeout: Duration,
+    #[serde(deserialize_with = "human_duration")]
+    cache_ttl: Duration,
+    cache_size: usize,
     max_response_bytes: usize,
+}
+
+impl Default for RawDnsConfig {
+    fn default() -> Self {
+        Self {
+            upstream: DEFAULT_DOH_UPSTREAM.to_owned(),
+            ca_certificate: None,
+            timeout: Duration::from_secs(10),
+            cache_ttl: Duration::from_secs(300),
+            cache_size: 256,
+            max_response_bytes: 65_536,
+        }
+    }
+}
+
+/// A target is either `"example.com"` (subdomains included) or
+/// `{ host = "example.com", subdomains = false }`.
+#[derive(Debug)]
+struct RawTarget {
+    host: String,
+    subdomains: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTargetConfig {
+struct RawTargetTable {
     host: String,
-    #[serde(default)]
-    include_subdomains: bool,
-    strategy: Strategy,
+    #[serde(default = "subdomains_by_default")]
+    subdomains: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,10 +247,14 @@ struct RawRuntimeLimits {
     max_connect_header_bytes: usize,
     max_client_hello_bytes: usize,
     max_connections: usize,
-    connect_timeout_seconds: u64,
-    client_hello_timeout_seconds: u64,
-    idle_timeout_seconds: u64,
-    shutdown_timeout_seconds: u64,
+    #[serde(deserialize_with = "human_duration")]
+    connect_timeout: Duration,
+    #[serde(deserialize_with = "human_duration")]
+    client_hello_timeout: Duration,
+    #[serde(deserialize_with = "human_duration")]
+    idle_timeout: Duration,
+    #[serde(deserialize_with = "human_duration")]
+    shutdown_timeout: Duration,
 }
 
 impl Default for RawRuntimeLimits {
@@ -207,19 +263,27 @@ impl Default for RawRuntimeLimits {
             max_connect_header_bytes: 16_384,
             max_client_hello_bytes: 262_144,
             max_connections: 256,
-            connect_timeout_seconds: 10,
-            client_hello_timeout_seconds: 5,
-            idle_timeout_seconds: 300,
-            shutdown_timeout_seconds: 10,
+            connect_timeout: Duration::from_secs(10),
+            client_hello_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(10),
         }
     }
 }
 
 impl Config {
     pub(crate) fn load(path: &Path) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.to_path_buf(),
-            source,
+        let contents = fs::read_to_string(path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::NotFound {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
         })?;
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         Self::parse(&contents, base_dir)
@@ -232,37 +296,28 @@ impl Config {
 
     fn validate(raw: RawConfig, base_dir: &Path) -> Result<Self, ConfigError> {
         let listen = parse_loopback_listener(&raw.proxy.listen)?;
-        let pac_listen = raw
-            .proxy
-            .pac_listen
-            .as_deref()
-            .map(parse_loopback_listener)
-            .transpose()?;
+        let pac_listen = match &raw.proxy.pac {
+            RawPac::Enabled(false) => None,
+            RawPac::Enabled(true) => Some(parse_loopback_listener(DEFAULT_PAC_LISTEN)?),
+            RawPac::Address(address) => Some(parse_loopback_listener(address)?),
+        };
         if pac_listen == Some(listen) && listen.port() != 0 {
             return Err(ConfigError::ListenerConflict);
         }
 
-        let allowed_ports = validate_allowed_ports(raw.proxy.allowed_ports, listen.port() == 0)?;
+        let allowed_ports = validate_allowed_ports(raw.proxy.ports, listen.port() == 0)?;
         let upstream = validate_doh_url(&raw.dns.upstream)?;
         let ca_certificate_pem = load_ca_certificate(raw.dns.ca_certificate, base_dir)?;
 
         let dns = DnsConfig {
             upstream,
             ca_certificate_pem,
-            timeout: duration(
-                "dns.timeout_seconds",
-                raw.dns.timeout_seconds,
-                MAX_TIMEOUT_SECONDS,
-            )?,
-            cache_max_ttl: duration(
-                "dns.cache_max_ttl_seconds",
-                raw.dns.cache_max_ttl_seconds,
-                MAX_CACHE_TTL_SECONDS,
-            )?,
+            timeout: bounded_duration("dns.timeout", raw.dns.timeout, MAX_TIMEOUT)?,
+            cache_max_ttl: bounded_duration("dns.cache_ttl", raw.dns.cache_ttl, MAX_CACHE_TTL)?,
             cache_capacity: bounded_usize(
-                "dns.cache_capacity",
-                raw.dns.cache_capacity,
-                MAX_DNS_CACHE_CAPACITY,
+                "dns.cache_size",
+                raw.dns.cache_size,
+                MAX_DNS_CACHE_SIZE,
             )?,
             max_response_bytes: bounded_usize(
                 "dns.max_response_bytes",
@@ -287,25 +342,25 @@ impl Config {
                 raw.limits.max_connections,
                 MAX_CONNECTIONS,
             )?,
-            connect_timeout: duration(
-                "limits.connect_timeout_seconds",
-                raw.limits.connect_timeout_seconds,
-                MAX_TIMEOUT_SECONDS,
+            connect_timeout: bounded_duration(
+                "limits.connect_timeout",
+                raw.limits.connect_timeout,
+                MAX_TIMEOUT,
             )?,
-            client_hello_timeout: duration(
-                "limits.client_hello_timeout_seconds",
-                raw.limits.client_hello_timeout_seconds,
-                MAX_TIMEOUT_SECONDS,
+            client_hello_timeout: bounded_duration(
+                "limits.client_hello_timeout",
+                raw.limits.client_hello_timeout,
+                MAX_TIMEOUT,
             )?,
-            idle_timeout: duration(
-                "limits.idle_timeout_seconds",
-                raw.limits.idle_timeout_seconds,
-                MAX_TIMEOUT_SECONDS,
+            idle_timeout: bounded_duration(
+                "limits.idle_timeout",
+                raw.limits.idle_timeout,
+                MAX_TIMEOUT,
             )?,
-            shutdown_timeout: duration(
-                "limits.shutdown_timeout_seconds",
-                raw.limits.shutdown_timeout_seconds,
-                MAX_SHUTDOWN_SECONDS,
+            shutdown_timeout: bounded_duration(
+                "limits.shutdown_timeout",
+                raw.limits.shutdown_timeout,
+                MAX_SHUTDOWN_TIMEOUT,
             )?,
         };
 
@@ -384,6 +439,91 @@ impl RuntimeLimits {
     }
 }
 
+impl<'de> Deserialize<'de> for RawTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TargetVisitor;
+
+        impl<'de> Visitor<'de> for TargetVisitor {
+            type Value = RawTarget;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a host name like \"example.com\" or a table like \
+                     { host = \"example.com\", subdomains = false }",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, host: &str) -> Result<RawTarget, E> {
+                Ok(RawTarget {
+                    host: host.to_owned(),
+                    subdomains: subdomains_by_default(),
+                })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<RawTarget, A::Error> {
+                let table =
+                    RawTargetTable::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(RawTarget {
+                    host: table.host,
+                    subdomains: table.subdomains,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(TargetVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawPac {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PacVisitor;
+
+        impl Visitor<'_> for PacVisitor {
+            type Value = RawPac;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a loopback address like \"127.0.0.1:8081\", or false")
+            }
+
+            fn visit_bool<E: de::Error>(self, enabled: bool) -> Result<RawPac, E> {
+                Ok(RawPac::Enabled(enabled))
+            }
+
+            fn visit_str<E: de::Error>(self, address: &str) -> Result<RawPac, E> {
+                Ok(RawPac::Address(address.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(PacVisitor)
+    }
+}
+
+fn human_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+    struct DurationVisitor;
+
+    impl Visitor<'_> for DurationVisitor {
+        type Value = Duration;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a duration string like \"500ms\", \"10s\", or \"5m\"")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Duration, E> {
+            humantime::parse_duration(value).map_err(|error| {
+                E::custom(format_args!(
+                    "invalid duration `{value}` ({error}); use values like \"500ms\", \"10s\", or \"5m\""
+                ))
+            })
+        }
+    }
+
+    deserializer.deserialize_str(DurationVisitor)
+}
+
+const fn subdomains_by_default() -> bool {
+    true
+}
+
 fn parse_loopback_listener(value: &str) -> Result<SocketAddr, ConfigError> {
     let address = SocketAddr::from_str(value).map_err(|_| ConfigError::InvalidListener {
         value: value.to_owned(),
@@ -453,7 +593,7 @@ fn load_ca_certificate(
     Ok(Some(pem))
 }
 
-fn validate_targets(raw_targets: Vec<RawTargetConfig>) -> Result<Vec<TargetRule>, ConfigError> {
+fn validate_targets(raw_targets: Vec<RawTarget>) -> Result<Vec<TargetRule>, ConfigError> {
     if raw_targets.is_empty() {
         return Err(ConfigError::EmptyTargets);
     }
@@ -462,8 +602,8 @@ fn validate_targets(raw_targets: Vec<RawTargetConfig>) -> Result<Vec<TargetRule>
         .map(|raw| {
             Ok(TargetRule::new(
                 DomainName::parse(&raw.host)?,
-                raw.include_subdomains,
-                raw.strategy,
+                raw.subdomains,
+                Strategy::TlsRecordSplit,
             ))
         })
         .collect::<Result<Vec<_>, DomainError>>()?;
@@ -482,36 +622,19 @@ fn bounded_usize(field: &'static str, value: usize, max: usize) -> Result<usize,
     Ok(value)
 }
 
-fn duration(field: &'static str, seconds: u64, max: u64) -> Result<Duration, ConfigError> {
-    if seconds == 0 || seconds > max {
-        return Err(ConfigError::OutOfBounds {
+fn bounded_duration(
+    field: &'static str,
+    value: Duration,
+    max: Duration,
+) -> Result<Duration, ConfigError> {
+    if value.is_zero() || value > max {
+        return Err(ConfigError::DurationOutOfBounds {
             field,
-            min: 1,
             max,
-            actual: seconds,
+            actual: value,
         });
     }
-    Ok(Duration::from_secs(seconds))
-}
-
-fn default_allowed_ports() -> Vec<u16> {
-    DEFAULT_ALLOWED_PORTS.to_vec()
-}
-
-fn default_dns_timeout_seconds() -> u64 {
-    10
-}
-
-fn default_cache_max_ttl_seconds() -> u64 {
-    300
-}
-
-fn default_cache_capacity() -> usize {
-    256
-}
-
-fn default_dns_response_bytes() -> usize {
-    65_536
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -526,7 +649,7 @@ mod tests {
 
     #[derive(Debug)]
     enum ExpectedConfigError {
-        Toml,
+        Toml(&'static str),
         InvalidListener(&'static str),
         NonLoopbackListener(SocketAddr),
         ListenerConflict,
@@ -542,13 +665,19 @@ mod tests {
             actual: u64,
             max: u64,
         },
+        DurationOutOfBounds {
+            field: &'static str,
+            actual: Duration,
+        },
     }
 
     impl ExpectedConfigError {
         fn matches(&self, actual: &ConfigError) -> bool {
             match (self, actual) {
-                (Self::Toml, ConfigError::Toml(_))
-                | (Self::ListenerConflict, ConfigError::ListenerConflict)
+                (Self::Toml(fragment), ConfigError::Toml(error)) => {
+                    error.to_string().contains(fragment)
+                }
+                (Self::ListenerConflict, ConfigError::ListenerConflict)
                 | (Self::InsecureDohUrl, ConfigError::InsecureDohUrl)
                 | (Self::UnsafeDohUrl, ConfigError::UnsafeDohUrl)
                 | (Self::EmptyTargets, ConfigError::EmptyTargets) => true,
@@ -589,42 +718,50 @@ mod tests {
                         && expected_actual == actual_value
                         && expected_max == actual_max
                 }
+                (
+                    Self::DurationOutOfBounds {
+                        field: expected_field,
+                        actual: expected_actual,
+                    },
+                    ConfigError::DurationOutOfBounds {
+                        field: actual_field,
+                        actual: actual_value,
+                        ..
+                    },
+                ) => expected_field == actual_field && expected_actual == actual_value,
                 _ => false,
             }
         }
     }
 
     const VALID: &str = r#"
+targets = ["reddit.com", "medium.com"]
+
 [proxy]
 listen = "127.0.0.1:8080"
-pac_listen = "[::1]:8081"
+pac = "[::1]:8081"
 
 [dns]
 upstream = "https://1.1.1.1/dns-query"
-
-[[targets]]
-host = "reddit.com"
-include_subdomains = true
-strategy = "tls-record-split"
-
-[[targets]]
-host = "medium.com"
-include_subdomains = true
-strategy = "tls-record-split"
 "#;
 
-    #[test]
-    fn representative_config_loads_and_materializes_defaults() {
+    fn parse(text: &str) -> Result<Config, ConfigError> {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("config.toml");
-        fs::write(&path, VALID).expect("write valid configuration");
-        let config = Config::load(&path).expect("valid configuration");
+        Config::parse(text, directory.path())
+    }
+
+    #[test]
+    fn targets_alone_is_a_complete_configuration() {
+        let config = parse("targets = [\"reddit.com\"]\n").expect("minimal configuration");
 
         assert_eq!(
             config.proxy.listen,
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.proxy.pac_listen, Some("[::1]:8081".parse().unwrap()));
+        assert_eq!(
+            config.proxy.pac_listen,
+            Some("127.0.0.1:8081".parse().unwrap())
+        );
         assert_eq!(config.proxy.allowed_ports, vec![443]);
         assert_eq!(config.dns.upstream.as_str(), "https://1.1.1.1/dns-query");
         assert!(config.dns.ca_certificate_pem.is_none());
@@ -639,30 +776,120 @@ strategy = "tls-record-split"
         assert_eq!(config.limits.client_hello_timeout, Duration::from_secs(5));
         assert_eq!(config.limits.idle_timeout, Duration::from_secs(300));
         assert_eq!(config.limits.shutdown_timeout, Duration::from_secs(10));
-        assert_eq!(config.targets.len(), 2);
+        assert_eq!(config.targets.len(), 1);
         assert_eq!(config.targets[0].host().as_str(), "reddit.com");
         assert!(config.targets[0].includes_subdomains());
         assert_eq!(config.targets[0].strategy(), Strategy::TlsRecordSplit);
     }
 
     #[test]
+    fn representative_config_overrides_defaults() {
+        let config = parse(VALID).expect("valid configuration");
+        assert_eq!(config.proxy.pac_listen, Some("[::1]:8081".parse().unwrap()));
+        assert_eq!(config.targets.len(), 2);
+        assert!(config.targets.iter().all(|rule| rule.includes_subdomains()));
+    }
+
+    #[test]
+    fn target_tables_and_pac_switch_shape_the_policy() {
+        let config = parse(
+            r#"
+targets = ["reddit.com", { host = "example.com", subdomains = false }, { host = "medium.com" }]
+
+[proxy]
+pac = false
+"#,
+        )
+        .expect("table targets");
+        assert_eq!(config.proxy.pac_listen, None);
+        let subdomains = |host: &str| {
+            config
+                .targets
+                .iter()
+                .find(|rule| rule.host().as_str() == host)
+                .expect("configured target")
+                .includes_subdomains()
+        };
+        assert!(subdomains("reddit.com"));
+        assert!(!subdomains("example.com"));
+        assert!(subdomains("medium.com"));
+
+        let enabled = parse("targets = [\"reddit.com\"]\n[proxy]\npac = true\n").unwrap();
+        assert_eq!(
+            enabled.proxy.pac_listen,
+            Some("127.0.0.1:8081".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn durations_accept_human_units() {
+        let config = parse(
+            r#"
+targets = ["reddit.com"]
+
+[dns]
+timeout = "1500ms"
+cache_ttl = "1h"
+
+[limits]
+connect_timeout = "2s"
+client_hello_timeout = "750ms"
+idle_timeout = "5m"
+shutdown_timeout = "1m"
+"#,
+        )
+        .expect("human durations");
+        assert_eq!(config.dns.timeout, Duration::from_millis(1500));
+        assert_eq!(config.dns.cache_max_ttl, Duration::from_secs(3600));
+        assert_eq!(config.limits.connect_timeout, Duration::from_secs(2));
+        assert_eq!(
+            config.limits.client_hello_timeout,
+            Duration::from_millis(750)
+        );
+        assert_eq!(config.limits.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.limits.shutdown_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
     fn rejects_unknown_missing_and_unsafe_values_with_exact_errors() {
-        let directory = tempdir().expect("temporary directory");
         let cases = [
             (
                 "unknown top-level field",
-                VALID.replace("[proxy]", "unknown = true\n[proxy]"),
-                ExpectedConfigError::Toml,
+                format!("unknown = true\n{VALID}"),
+                ExpectedConfigError::Toml("unknown field `unknown`"),
             ),
             (
                 "unknown nested field",
                 VALID.replace("[dns]", "[dns]\nunknown = true"),
-                ExpectedConfigError::Toml,
+                ExpectedConfigError::Toml("unknown field `unknown`"),
             ),
             (
-                "missing required listener",
-                VALID.replace("listen = \"127.0.0.1:8080\"", ""),
-                ExpectedConfigError::Toml,
+                "missing targets",
+                VALID.replace("targets = [\"reddit.com\", \"medium.com\"]", ""),
+                ExpectedConfigError::Toml("missing field `targets`"),
+            ),
+            (
+                "misspelled target key",
+                VALID.replace(
+                    "\"medium.com\"",
+                    "{ host = \"medium.com\", subdomain = false }",
+                ),
+                ExpectedConfigError::Toml("unknown field `subdomain`"),
+            ),
+            (
+                "target of the wrong type",
+                VALID.replace("\"medium.com\"", "42"),
+                ExpectedConfigError::Toml("a host name like \"example.com\""),
+            ),
+            (
+                "integer duration",
+                VALID.replace("[dns]", "[dns]\ntimeout = 10"),
+                ExpectedConfigError::Toml("a duration string like \"500ms\""),
+            ),
+            (
+                "unparseable duration",
+                VALID.replace("[dns]", "[dns]\ntimeout = \"ten seconds\""),
+                ExpectedConfigError::Toml("invalid duration `ten seconds`"),
             ),
             (
                 "malformed listener",
@@ -680,6 +907,11 @@ strategy = "tls-record-split"
                 ExpectedConfigError::ListenerConflict,
             ),
             (
+                "PAC of the wrong type",
+                VALID.replace("\"[::1]:8081\"", "8081"),
+                ExpectedConfigError::Toml("a loopback address like \"127.0.0.1:8081\", or false"),
+            ),
+            (
                 "insecure DoH URL",
                 VALID.replace("https://1.1.1.1", "http://1.1.1.1"),
                 ExpectedConfigError::InsecureDohUrl,
@@ -693,11 +925,6 @@ strategy = "tls-record-split"
                 ExpectedConfigError::UnsafeDohUrl,
             ),
             (
-                "unsupported strategy",
-                VALID.replace("strategy = \"tls-record-split\"", "strategy = \"unknown\""),
-                ExpectedConfigError::Toml,
-            ),
-            (
                 "canonical duplicate target",
                 VALID.replace("medium.com", "Reddit.com."),
                 ExpectedConfigError::DomainDuplicate("reddit.com"),
@@ -709,10 +936,7 @@ strategy = "tls-record-split"
             ),
             (
                 "empty targets",
-                format!(
-                    "targets = []\n{}",
-                    &VALID[..VALID.find("[[targets]]").unwrap()]
-                ),
+                VALID.replace("[\"reddit.com\", \"medium.com\"]", "[]"),
                 ExpectedConfigError::EmptyTargets,
             ),
             (
@@ -734,43 +958,74 @@ strategy = "tls-record-split"
                 },
             ),
             (
+                "zero duration",
+                format!("{VALID}\n[limits]\nidle_timeout = \"0s\"\n"),
+                ExpectedConfigError::DurationOutOfBounds {
+                    field: "limits.idle_timeout",
+                    actual: Duration::ZERO,
+                },
+            ),
+            (
+                "excessive duration",
+                format!("{VALID}\n[limits]\nshutdown_timeout = \"2m\"\n"),
+                ExpectedConfigError::DurationOutOfBounds {
+                    field: "limits.shutdown_timeout",
+                    actual: Duration::from_secs(120),
+                },
+            ),
+            (
                 "disallowed port",
-                VALID.replace("[proxy]", "[proxy]\nallowed_ports = [80]"),
+                VALID.replace("[proxy]", "[proxy]\nports = [80]"),
                 ExpectedConfigError::UnsafePort(80),
             ),
             (
                 "duplicate port",
-                VALID.replace("[proxy]", "[proxy]\nallowed_ports = [443, 443]"),
+                VALID.replace("[proxy]", "[proxy]\nports = [443, 443]"),
                 ExpectedConfigError::DuplicatePort(443),
             ),
         ];
 
         for (case, invalid, expected) in cases {
-            let error = Config::parse(&invalid, directory.path())
-                .expect_err("invalid configuration must be rejected");
+            let error = parse(&invalid).expect_err("invalid configuration must be rejected");
             assert!(
                 expected.matches(&error),
-                "{case}: expected {expected:?}, got {error:?}"
+                "{case}: expected {expected:?}, got {error}"
             );
         }
     }
 
     #[test]
-    fn ephemeral_loopback_listener_mode_is_scoped_and_keeps_production_ports_safe() {
+    fn duration_bound_errors_read_in_human_units() {
+        let error = parse(&format!("{VALID}\n[limits]\nshutdown_timeout = \"2m\"\n")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "limits.shutdown_timeout must be greater than 0 and at most 1m, got 2m"
+        );
+    }
+
+    #[test]
+    fn missing_file_points_at_init() {
         let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("absent.toml");
+        let error = Config::load(&path).unwrap_err();
+        assert!(matches!(error, ConfigError::NotFound { .. }));
+        assert!(error.to_string().contains("run `splithello init`"));
+    }
+
+    #[test]
+    fn ephemeral_loopback_listener_mode_is_scoped_and_keeps_production_ports_safe() {
         let ephemeral = VALID
             .replace("127.0.0.1:8080", "127.0.0.1:0")
             .replace("[::1]:8081", "127.0.0.1:0")
-            .replace("[proxy]", "[proxy]\nallowed_ports = [49199]");
-        let config = Config::parse(&ephemeral, directory.path()).expect("ephemeral test config");
+            .replace("[proxy]", "[proxy]\nports = [49199]");
+        let config = parse(&ephemeral).expect("ephemeral test config");
         assert_eq!(config.proxy.listen.port(), 0);
         assert_eq!(config.proxy.pac_listen.unwrap().port(), 0);
         assert_eq!(config.proxy.allowed_ports, vec![49199]);
-        assert!(config.proxy.listen.port() == 0);
 
-        let production = VALID.replace("[proxy]", "[proxy]\nallowed_ports = [49199]");
+        let production = VALID.replace("[proxy]", "[proxy]\nports = [49199]");
         assert!(matches!(
-            Config::parse(&production, directory.path()),
+            parse(&production),
             Err(ConfigError::UnsafePort { port: 49199 })
         ));
     }
@@ -780,30 +1035,21 @@ strategy = "tls-record-split"
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let config = Config::load(&root.join("config.example.toml"))
             .expect("repository example must load through production Config::load");
+        let defaults = parse("targets = [\"reddit.com\", \"medium.com\"]\n").unwrap();
 
-        assert_eq!(
-            config.proxy.listen,
-            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(
-            config.proxy.pac_listen,
-            Some("127.0.0.1:8081".parse::<SocketAddr>().unwrap())
-        );
-        assert_eq!(config.proxy.allowed_ports, vec![443]);
-        assert_ne!(config.proxy.listen.port(), 0);
-        assert_eq!(config.dns.upstream.as_str(), "https://1.1.1.1/dns-query");
+        assert_eq!(config.proxy.listen, defaults.proxy.listen);
+        assert_eq!(config.proxy.pac_listen, defaults.proxy.pac_listen);
+        assert_eq!(config.proxy.allowed_ports, defaults.proxy.allowed_ports);
+        assert_eq!(config.dns.upstream, defaults.dns.upstream);
         assert!(config.dns.ca_certificate_pem.is_none());
-        assert_eq!(config.dns.timeout, Duration::from_secs(10));
-        assert_eq!(config.dns.cache_max_ttl, Duration::from_secs(300));
-        assert_eq!(config.dns.cache_capacity, 256);
-        assert_eq!(config.dns.max_response_bytes, 65_536);
-        assert_eq!(config.limits.max_connect_header_bytes, 16_384);
-        assert_eq!(config.limits.max_client_hello_bytes, 262_144);
-        assert_eq!(config.limits.max_connections, 256);
-        assert_eq!(config.limits.connect_timeout, Duration::from_secs(10));
-        assert_eq!(config.limits.client_hello_timeout, Duration::from_secs(5));
-        assert_eq!(config.limits.idle_timeout, Duration::from_secs(300));
-        assert_eq!(config.limits.shutdown_timeout, Duration::from_secs(10));
+        assert_eq!(config.dns.timeout, defaults.dns.timeout);
+        assert_eq!(config.dns.cache_max_ttl, defaults.dns.cache_max_ttl);
+        assert_eq!(config.dns.cache_capacity, defaults.dns.cache_capacity);
+        assert_eq!(
+            config.limits.max_connections,
+            defaults.limits.max_connections
+        );
+        assert_eq!(config.limits.idle_timeout, defaults.limits.idle_timeout);
         assert_eq!(config.targets.len(), 2);
         for (rule, host) in config.targets.iter().zip(["reddit.com", "medium.com"]) {
             assert_eq!(rule.host().as_str(), host);
@@ -814,7 +1060,10 @@ strategy = "tls-record-split"
         let readme = fs::read_to_string(root.join("README.md")).expect("read repository README");
         for required in [
             "cargo build --release",
-            "./target/release/splithello start --config config.example.toml",
+            "./target/release/splithello init",
+            "./target/release/splithello check",
+            "./target/release/splithello start",
+            "--config config.example.toml",
             "127.0.0.1:8080",
             "http://127.0.0.1:8081/proxy.pac",
             "outcome=ready",

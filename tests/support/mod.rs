@@ -415,22 +415,20 @@ pub struct TestConfig<'a> {
 }
 
 impl TestConfig<'_> {
-    fn render(&self, proxy: SocketAddr, pac: Option<SocketAddr>) -> String {
-        let pac = pac
-            .map(|addr| format!("pac_listen = \"{addr}\"\n"))
-            .unwrap_or_default();
+    pub fn render(&self, proxy: SocketAddr, pac: Option<SocketAddr>) -> String {
+        let pac = pac.map_or_else(|| "false".to_owned(), |addr| format!("\"{addr}\""));
         let secret = self
             .injected_secret
             .map(|secret| format!("# {secret}\n"))
             .unwrap_or_default();
         format!(
-            "{secret}[proxy]\nlisten = \"{proxy}\"\n{pac}allowed_ports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout_seconds = 1\ncache_max_ttl_seconds = 30\ncache_capacity = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout_seconds = 1\nclient_hello_timeout_seconds = 1\nidle_timeout_seconds = 2\nshutdown_timeout_seconds = {}\n\n[[targets]]\nhost = \"{}\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n",
+            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
+            self.target_host,
             self.origin_port,
             self.doh.url(),
             self.doh.ca_pem.display(),
             self.max_connections,
             self.shutdown_seconds,
-            self.target_host,
         )
     }
 }
