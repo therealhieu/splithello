@@ -1,10 +1,15 @@
 name: release
 # A pushed `v*` tag builds every target, publishes a GitHub release, then the Homebrew
 # formula and the crates.io package (not for prereleases, whose tags contain `-`).
-# A manual run is a dry run: the same builds and checks, nothing published.
+# A manual run, or a pull request that changes the release pipeline, is a dry run: the same
+# builds and checks, nothing published.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/formula.sh
   workflow_dispatch:
 
 permissions:
@@ -12,7 +17,7 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
