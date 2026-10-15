@@ -26,7 +26,7 @@ The proxy preserves browser-to-origin TLS. It does not terminate TLS, install ce
 | clap | `start`, `init`, `check` CLI with optional `--config <PATH>` | [Cargo.toml](../../Cargo.toml), [`src/cli.rs`](../../src/cli.rs) |
 | Serde / TOML / humantime / IDNA | Strict configuration, human durations, canonical domain values | [Cargo.toml](../../Cargo.toml), [`src/config.rs`](../../src/config.rs), [`src/domain.rs`](../../src/domain.rs) |
 | reqwest + rustls / hickory-proto | Authenticated RFC 8484 DoH and DNS wire messages | [Cargo.toml](../../Cargo.toml), [`src/dns.rs`](../../src/dns.rs) |
-| thiserror / tracing | Structured errors and stable secret-safe diagnostics | [Cargo.toml](../../Cargo.toml), [`src/diagnostics.rs`](../../src/diagnostics.rs) |
+| thiserror / tracing / jiff | Structured errors, stable secret-safe diagnostics, human or logfmt stdout with local timestamps | [Cargo.toml](../../Cargo.toml), [`src/diagnostics.rs`](../../src/diagnostics.rs), [`src/logging.rs`](../../src/logging.rs) |
 | rcgen / tokio-rustls | Dev-only authenticated local DoH test boundary | [Cargo.toml](../../Cargo.toml), [`tests/support/mod.rs`](../../tests/support/mod.rs) |
 
 Reqwest default features are disabled. The active client uses rustls, disables ambient proxy discovery and redirects, enforces HTTPS and timeouts, and exposes no invalid-certificate acceptance path. `dns.ca_certificate` adds PEM trust roots; it never disables certificate verification.
@@ -35,7 +35,8 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 
 | Path | Responsibility |
 |---|---|
-| [`src/main.rs`](../../src/main.rs) | Tracing initialization, CLI dispatch, validated configuration, runtime lifecycle, process exit mapping |
+| [`src/main.rs`](../../src/main.rs) | CLI dispatch, validated configuration, runtime lifecycle, process exit mapping |
+| [`src/logging.rs`](../../src/logging.rs) | Subscriber setup: `-v`/`-q`/`--log-format`; human formatter (banner, aligned tunnel lines, hints, summaries) and logfmt |
 | [`src/cli.rs`](../../src/cli.rs) | `start` / `init` / `check` commands and the per-user default config path |
 | [`src/config.rs`](../../src/config.rs) | Strict TOML schema (only `targets` required), defaults, hard bounds, loopback and safe-port validation |
 | [`src/setup.rs`](../../src/setup.rs) | `init` (writes the example) and `check` (config summary, listener and DoH probes) |
@@ -102,7 +103,7 @@ The transformed records preserve the exact ClientHello handshake byte sequence. 
 | `TargetResolver` | Selected hosts return validated IPv4 A candidates from authenticated DoH only |
 | `SystemResolver` | Unselected hosts retain normal ordered IPv4/IPv6 operating-system candidates |
 | `RewriteOutcome` | Explicit rewritten, safe pass-through, need-more, or rejected state; no partial transformed output |
-| `Outcome` / `TunnelReport` | Stable categories and bounded metadata; no raw headers, DNS messages, ClientHello bytes, credentials, cookies, or application payloads |
+| `Outcome` / `TunnelReport` | Stable categories and bounded metadata; no raw headers, DNS messages, ClientHello bytes, credentials, cookies, or application payloads. Levels: split INFO, direct/cancelled DEBUG, failures WARN with a `hint`; a per-minute summary at INFO |
 | PAC | Exact configured hosts and enabled subdomains use `PROXY`; all others use `DIRECT` |
 
 The scoped loopback port-0 mode exists for deterministic integration tests. It allows explicit nonstandard ports to be listed for test origins, but CONNECT parsing still requires exact membership in `proxy.ports`. Normal nonzero listener configurations remain limited to ports 443 and 8443.

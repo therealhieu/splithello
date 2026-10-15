@@ -32,7 +32,30 @@ Configure your browser or operating system with one option:
 
 Then open a configured target such as `https://www.reddit.com/`.
 
-A successful start logs `outcome=ready`. Keep the process running while browsing.
+A successful start prints a ready banner (`outcome=ready` when logs are piped). Keep the process running while browsing.
+
+### Logs
+
+In a terminal, logs are short aligned lines. Each split target tunnel gets one line; failures get a hint; a summary line appears every minute that saw traffic:
+
+```text
+SplitHello 0.1.0 ready
+  proxy  127.0.0.1:8080   browser HTTPS proxy
+  pac    http://127.0.0.1:8081/proxy.pac   or this PAC URL
+  dns    1.1.1.1 (DoH)   2 target(s)
+21:22:10 ✓ split    www.reddit.com                 397ms  ↑596B ↓13K
+21:22:11 ✗ dns      old.reddit.com                 DoH request timed out → check that [dns].upstream is reachable (`splithello check`)
+21:23:10 · last 1m: 37 tunnels (12 split, 24 direct, 1 failed) · 6 active
+```
+
+| Flag | Effect |
+|---|---|
+| `-v` | Also show every direct (non-target) tunnel |
+| `-vv` | Trace output, including dependency debug logs |
+| `-q` | Only warnings and errors |
+| `--log-format human\|logfmt\|auto` | `auto` (default) is human on a terminal, timestamped `key=value` logfmt when piped |
+
+`RUST_LOG` overrides the level flags.
 
 ## Explanations
 
@@ -72,15 +95,15 @@ The DoH endpoint host must be bootstrap-reachable without resolving any configur
 
 ### Outcomes
 
-| Outcome | Meaning |
-|---|---|
-| `outcome=target-transformed` | A target used DoH and ClientHello splitting. |
-| `outcome=direct-relay` | A non-target used normal system resolution and unchanged relay. |
-| `outcome=dns-error` | DoH failed or returned no valid IPv4 address. |
-| `outcome=connect-error` | The proxy could not connect to the listener or origin. |
-| `outcome=tls-error` | The ClientHello was incomplete, invalid, or did not match the CONNECT host. |
-| `outcome=timeout` | A configured deadline expired. |
-| `outcome=unsupported-request` | The request was not a supported hostname-form HTTP/1.1 CONNECT request. |
+| Outcome | Terminal label | Meaning |
+|---|---|---|
+| `outcome=target-transformed` | `✓ split` | A target used DoH and ClientHello splitting. |
+| `outcome=direct-relay` | `· direct` (with `-v`) | A non-target used normal system resolution and unchanged relay. |
+| `outcome=dns-error` | `✗ dns` | DoH failed or returned no valid IPv4 address. |
+| `outcome=connect-error` | `✗ connect` | The proxy could not connect to the listener or origin. |
+| `outcome=tls-error` | `✗ tls` | The ClientHello was incomplete, invalid, or did not match the CONNECT host. |
+| `outcome=timeout` | `✗ timeout` | A configured deadline expired. |
+| `outcome=unsupported-request` | `✗ request` | The request was not a supported hostname-form HTTP/1.1 CONNECT request. |
 
 ### Limits
 

@@ -121,7 +121,7 @@ impl PacServer {
                     serve_pac_client(stream, &body, max_request_bytes, request_timeout, &cancel)
                         .await
                 {
-                    tracing::info!(
+                    tracing::debug!(
                         outcome = %error.outcome(),
                         error = %error,
                         "PAC request failed"

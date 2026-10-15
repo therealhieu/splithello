@@ -327,7 +327,10 @@ async fn v18_exact_start_command_reaches_ready_and_serves_target_only_pac() {
     assert!(output.contains("target_count=1"));
     assert!(output.contains("doh_host=localhost"));
     assert!(output.contains("transport=\"IPv4 TCP only for selected targets\""));
-    assert!(output.contains("scope=\"explicit loopback proxy; not a VPN\""));
+    assert!(
+        output.starts_with("20"),
+        "piped output is timestamped logfmt: {output}"
+    );
 
     let response = fetch_pac(process.pac_addr.unwrap()).await;
     let text = String::from_utf8(response).unwrap();

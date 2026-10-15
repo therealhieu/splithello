@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use crate::diagnostics::{Outcome, TunnelReport};
+use crate::diagnostics::{Outcome, ProxyStats, TunnelReport, log_tunnel, log_tunnel_error};
 use crate::dns::{ResolveError, SystemResolver, TargetResolver};
 use crate::domain::{DomainError, DomainName, TargetMatcher};
 use crate::tls::RewriteOutcome;
@@ -270,6 +270,7 @@ pub(crate) struct ProxyState {
     allowed_ports: BTreeSet<u16>,
     limits: ProxyLimits,
     concurrency: Arc<Semaphore>,
+    stats: Arc<ProxyStats>,
 }
 
 pub(crate) struct ProxyServer {
@@ -336,24 +337,20 @@ impl ProxyServer {
             let (client, _) = accepted.map_err(ProxyServiceError::Accept)?;
             let state = Arc::clone(&self.state);
             let cancel = self.cancel.child_token();
+            state.stats.opened();
             children.spawn(async move {
-                match handle_client_with_permit(client, state, cancel, permit).await {
-                    Ok(report) => tracing::info!(
-                        host = %report.host(),
-                        port = report.port(),
-                        target = report.is_target(),
-                        outcome = %report.outcome(),
-                        duration_ms = report.duration().as_millis(),
-                        bytes_up = report.bytes_up(),
-                        bytes_down = report.bytes_down(),
-                        "tunnel completed"
-                    ),
-                    Err(error) => tracing::info!(
-                        outcome = %error.outcome(),
-                        error = %error,
-                        "tunnel ended before a report was available"
-                    ),
-                }
+                let stats = Arc::clone(&state.stats);
+                let outcome = match handle_client_with_permit(client, state, cancel, permit).await {
+                    Ok(report) => {
+                        log_tunnel(&report);
+                        report.outcome()
+                    }
+                    Err(error) => {
+                        log_tunnel_error(error.outcome(), &error);
+                        error.outcome()
+                    }
+                };
+                stats.closed(outcome);
             });
         }
     }
@@ -400,7 +397,12 @@ impl ProxyState {
             allowed_ports: allowed_ports.into_iter().collect(),
             limits,
             concurrency: Arc::new(Semaphore::new(max_connections)),
+            stats: Arc::default(),
         }
+    }
+
+    pub(crate) fn stats(&self) -> Arc<ProxyStats> {
+        Arc::clone(&self.stats)
     }
 
     #[cfg(test)]

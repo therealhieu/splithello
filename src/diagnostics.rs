@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::domain::DomainName;
@@ -21,6 +22,59 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::Ready,
+        Self::DirectRelay,
+        Self::TargetTransformed,
+        Self::UnsupportedRequest,
+        Self::ConfigError,
+        Self::DnsError,
+        Self::ConnectError,
+        Self::TlsError,
+        Self::Timeout,
+        Self::Cancelled,
+        Self::InternalError,
+    ];
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == value)
+    }
+
+    /// Short column label for human-readable logs.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::DirectRelay => "direct",
+            Self::TargetTransformed => "split",
+            Self::UnsupportedRequest => "request",
+            Self::ConfigError => "config",
+            Self::DnsError => "dns",
+            Self::ConnectError => "connect",
+            Self::TlsError => "tls",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancel",
+            Self::InternalError => "internal",
+        }
+    }
+
+    /// What a user can do about a failure; `None` for successful outcomes.
+    pub(crate) const fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Ready | Self::DirectRelay | Self::TargetTransformed | Self::Cancelled => None,
+            Self::UnsupportedRequest => {
+                Some("only HTTPS CONNECT is proxied; check the browser proxy settings")
+            }
+            Self::ConfigError => Some("fix the configuration, then run `splithello check`"),
+            Self::DnsError => Some("check that [dns].upstream is reachable (`splithello check`)"),
+            Self::ConnectError => Some("the site or its address may be blocked or down"),
+            Self::TlsError => Some("the TLS ClientHello was malformed or named another host"),
+            Self::Timeout => Some("a deadline expired; the network or site may be slow"),
+            Self::InternalError => Some("unexpected; please report it with the log line"),
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Ready => "ready",
@@ -121,13 +175,165 @@ impl fmt::Display for TunnelReport {
     }
 }
 
+/// Emits one tunnel's report: splits at INFO, direct relays and cancellations at DEBUG
+/// (the bulk of browser traffic), failures at WARN with a hint.
+pub(crate) fn log_tunnel(report: &TunnelReport) {
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                host = %report.host(),
+                port = report.port(),
+                target = report.is_target(),
+                outcome = %report.outcome(),
+                duration_ms = report.duration().as_millis() as u64,
+                bytes_up = report.bytes_up(),
+                bytes_down = report.bytes_down(),
+                hint = report.outcome().hint(),
+                "tunnel completed"
+            )
+        };
+    }
+    match report.outcome() {
+        Outcome::TargetTransformed => emit!(tracing::Level::INFO),
+        Outcome::DirectRelay | Outcome::Cancelled => emit!(tracing::Level::DEBUG),
+        _ => emit!(tracing::Level::WARN),
+    }
+}
+
+/// Emits a tunnel that ended before a CONNECT host was known.
+pub(crate) fn log_tunnel_error(outcome: Outcome, error: &dyn fmt::Display) {
+    macro_rules! emit {
+        ($level:expr) => {
+            tracing::event!(
+                $level,
+                outcome = %outcome,
+                error = %error,
+                hint = outcome.hint(),
+                "tunnel ended before a report was available"
+            )
+        };
+    }
+    if outcome == Outcome::Cancelled {
+        emit!(tracing::Level::DEBUG);
+    } else {
+        emit!(tracing::Level::WARN);
+    }
+}
+
+/// Live tunnel counters for the periodic summary line.
+#[derive(Debug, Default)]
+pub(crate) struct ProxyStats {
+    active: AtomicU64,
+    split: AtomicU64,
+    direct: AtomicU64,
+    failed: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WindowSummary {
+    pub(crate) split: u64,
+    pub(crate) direct: u64,
+    pub(crate) failed: u64,
+    pub(crate) active: u64,
+}
+
+impl WindowSummary {
+    pub(crate) const fn tunnels(&self) -> u64 {
+        self.split + self.direct + self.failed
+    }
+}
+
+impl ProxyStats {
+    pub(crate) fn opened(&self) {
+        self.active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn closed(&self, outcome: Outcome) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        let counter = match outcome {
+            Outcome::TargetTransformed => &self.split,
+            Outcome::DirectRelay => &self.direct,
+            Outcome::Cancelled => return,
+            _ => &self.failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the counts since the previous call and resets them.
+    pub(crate) fn take_window(&self) -> WindowSummary {
+        WindowSummary {
+            split: self.split.swap(0, Ordering::Relaxed),
+            direct: self.direct.swap(0, Ordering::Relaxed),
+            failed: self.failed.swap(0, Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(crate) fn log_summary(window: Duration, summary: WindowSummary) {
+    tracing::info!(
+        window = %humantime::format_duration(window),
+        tunnels = summary.tunnels(),
+        split = summary.split,
+        direct = summary.direct,
+        failed = summary.failed,
+        active = summary.active,
+        "summary"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use crate::domain::DomainName;
 
-    use super::{Outcome, TunnelReport};
+    use super::{Outcome, ProxyStats, TunnelReport, WindowSummary};
+
+    #[test]
+    fn every_outcome_parses_back_and_failures_carry_hints() {
+        for outcome in Outcome::ALL {
+            assert_eq!(Outcome::parse(outcome.as_str()), Some(outcome));
+            let failure = !matches!(
+                outcome,
+                Outcome::Ready
+                    | Outcome::DirectRelay
+                    | Outcome::TargetTransformed
+                    | Outcome::Cancelled
+            );
+            assert_eq!(outcome.hint().is_some(), failure, "{outcome}");
+        }
+        assert_eq!(Outcome::parse("unknown"), None);
+    }
+
+    #[test]
+    fn stats_count_a_window_and_reset() {
+        let stats = ProxyStats::default();
+        for outcome in [
+            Outcome::TargetTransformed,
+            Outcome::DirectRelay,
+            Outcome::DirectRelay,
+            Outcome::DnsError,
+            Outcome::Cancelled,
+        ] {
+            stats.opened();
+            stats.closed(outcome);
+        }
+        stats.opened();
+        let window = stats.take_window();
+        assert_eq!(
+            window,
+            WindowSummary {
+                split: 1,
+                direct: 2,
+                failed: 1,
+                active: 1,
+            }
+        );
+        assert_eq!(window.tunnels(), 4);
+        assert_eq!(stats.take_window().tunnels(), 0);
+    }
 
     #[test]
     fn outcome_strings_are_stable_kebab_case() {

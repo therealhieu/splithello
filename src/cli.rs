@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
+
+use crate::logging::{LogFormat, LogOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -12,6 +14,31 @@ use clap::{Args, Parser, Subcommand};
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+    /// Show more: -v adds every direct tunnel, -vv adds trace output.
+    #[arg(short, long, action = ArgAction::Count, global = true)]
+    pub(crate) verbose: u8,
+    /// Show only warnings and errors.
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    pub(crate) quiet: bool,
+    /// Log format; `auto` is human on a terminal and logfmt otherwise. RUST_LOG overrides levels.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        global = true,
+        value_name = "FORMAT"
+    )]
+    pub(crate) log_format: LogFormat,
+}
+
+impl Cli {
+    pub(crate) fn log_options(&self) -> LogOptions {
+        LogOptions {
+            format: self.log_format,
+            verbose: self.verbose,
+            quiet: self.quiet,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +103,7 @@ mod tests {
     use clap::Parser;
 
     use super::{Cli, Command, config_path_from};
+    use crate::logging::LogFormat;
 
     #[test]
     fn start_config_is_optional() {
@@ -108,6 +136,21 @@ mod tests {
 
         let cli = Cli::try_parse_from(["splithello", "check"]).expect("valid CLI");
         assert!(matches!(cli.command, Command::Check(_)));
+    }
+
+    #[test]
+    fn log_flags_are_global_and_exclusive() {
+        let cli = Cli::try_parse_from(["splithello", "start", "-vv", "--log-format", "logfmt"])
+            .expect("valid CLI");
+        assert_eq!(cli.verbose, 2);
+        assert_eq!(cli.log_format, LogFormat::Logfmt);
+
+        let cli = Cli::try_parse_from(["splithello", "-q", "start"]).expect("valid CLI");
+        assert!(cli.quiet);
+        assert_eq!(cli.log_format, LogFormat::Auto);
+
+        let error = Cli::try_parse_from(["splithello", "start", "-q", "-v"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

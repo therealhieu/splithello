@@ -9,11 +9,13 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ConfigError};
-use crate::diagnostics::Outcome;
+use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
 use crate::domain::DomainError;
 use crate::pac::{PacServer, PacServiceError, render_pac};
 use crate::proxy::{ProxyLimits, ProxyServer, ProxyServiceError, ProxyState};
+
+const SUMMARY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadyMetadata {
@@ -60,8 +62,6 @@ impl ReadyMetadata {
             target_count = self.target_count,
             doh_host = %self.doh_host,
             transport = self.transport(),
-            setup = "configure the browser HTTPS proxy or PAC URL",
-            scope = "explicit loopback proxy; not a VPN",
             "SplitHello is ready"
         );
     }
@@ -155,6 +155,7 @@ impl Runtime {
             limits,
             config.limits().max_connections(),
         ));
+        let stats = state.stats();
         let cancel = CancellationToken::new();
         let shutdown_timeout = config.limits().shutdown_timeout();
 
@@ -217,6 +218,7 @@ impl Runtime {
             );
             tasks.spawn(async move { pac.run().await.map_err(AppError::from) });
         }
+        tasks.spawn(report_summaries(stats, cancel.child_token()));
 
         Ok(Self {
             cancel,
@@ -257,6 +259,26 @@ impl Runtime {
     pub(crate) async fn shutdown(mut self) -> Result<(), AppError> {
         self.cancel.cancel();
         drain_tasks(&mut self.tasks, self.shutdown_timeout).await
+    }
+}
+
+/// Logs one summary line per window that saw traffic, so a quiet terminal still shows
+/// the proxy is alive and how traffic splits between targets and direct relays.
+async fn report_summaries(
+    stats: Arc<ProxyStats>,
+    cancel: CancellationToken,
+) -> Result<(), AppError> {
+    let mut interval = tokio::time::interval_at(Instant::now() + SUMMARY_WINDOW, SUMMARY_WINDOW);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = interval.tick() => {
+                let window = stats.take_window();
+                if window.tunnels() > 0 {
+                    log_summary(SUMMARY_WINDOW, window);
+                }
+            }
+        }
     }
 }
 

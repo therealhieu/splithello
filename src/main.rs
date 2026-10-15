@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod dns;
 mod domain;
+mod logging;
 mod pac;
 mod proxy;
 mod setup;
@@ -15,24 +16,28 @@ use app::{AppError, Runtime};
 use clap::Parser;
 use cli::{Cli, Command, ConfigArgs};
 use config::Config;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
-    init_tracing();
-    match run().await {
+    let cli = Cli::parse();
+    logging::init(&cli.log_options());
+    match run(cli).await {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {
-            tracing::error!(outcome = %error.outcome(), error = %error, "SplitHello stopped");
+            tracing::error!(
+                outcome = %error.outcome(),
+                error = %error,
+                hint = error.outcome().hint(),
+                "SplitHello stopped"
+            );
             std::process::exit(1);
         }
     }
 }
 
 /// Returns `Ok(false)` when a command finished but reported failures (`check`).
-async fn run() -> Result<bool, AppError> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<bool, AppError> {
     match cli.command {
         Command::Start(args) => {
             let config = Config::load(&config_path(&args)?)?;
@@ -53,13 +58,4 @@ async fn run() -> Result<bool, AppError> {
 
 fn config_path(args: &ConfigArgs) -> Result<PathBuf, AppError> {
     args.path().ok_or(AppError::NoConfigPath)
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .init();
 }

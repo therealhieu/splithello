@@ -300,9 +300,12 @@ impl RunningSplitHello {
         let configured_pac = config
             .with_pac
             .then_some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
-        Self::start_with_config(
+        // Tests assert on every tunnel outcome, including DEBUG-level direct relays.
+        Self::spawn(
+            Path::new(env!("CARGO_BIN_EXE_splithello")),
             &config.render(configured_proxy, configured_pac),
             config.with_pac,
+            "debug",
         )
     }
 
@@ -317,8 +320,12 @@ impl RunningSplitHello {
     }
 
     /// Like [`Self::start_with_config`] for an arbitrary build, e.g. a base-ref binary
-    /// in a paired benchmark.
+    /// in a paired benchmark. Logs at the default `info` level, as a user would run it.
     pub fn start_binary(binary: &Path, config_text: &str, with_pac: bool) -> Self {
+        Self::spawn(binary, config_text, with_pac, "info")
+    }
+
+    fn spawn(binary: &Path, config_text: &str, with_pac: bool, rust_log: &str) -> Self {
         let directory = tempfile::tempdir().expect("create process config directory");
         let config_path = directory.path().join("config.toml");
         fs::write(&config_path, config_text).expect("write process configuration");
@@ -327,7 +334,7 @@ impl RunningSplitHello {
             .arg("start")
             .arg("--config")
             .arg(&config_path)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", rust_log)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
