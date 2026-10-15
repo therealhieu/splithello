@@ -91,3 +91,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build
 cargo test --workspace
 ```
+
+### Benchmarks
+
+End-to-end benchmarks drive the release binary over loopback with a simulated DoH round trip:
+
+```sh
+scripts/bench.sh compare main      # base vs HEAD in alternating rounds; fails on a >5% regression
+scripts/bench.sh run               # criterion run of HEAD
+scripts/bench.sh snapshot <label>  # record that run in benches/results/
+```
+
+Scenarios, method, and recorded results live in [`benches/BASELINE.md`](benches/BASELINE.md).

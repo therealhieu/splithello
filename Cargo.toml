@@ -18,7 +18,13 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 predicates = "3.1.4"
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+serde_json = "1.0.154"
 tempfile = "3.27.0"
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring"] }
+
+[[bench]]
+name = "proxy"
+harness = false
