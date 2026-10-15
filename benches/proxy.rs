@@ -52,6 +52,9 @@ const THROUGHPUT_DOWN: u64 = 64 * 1024 * 1024;
 const THROUGHPUT_BIDIR: u64 = 32 * 1024 * 1024;
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 const BASE_BIN_ENV: &str = "SPLITHELLO_BENCH_BASE_BIN";
+/// When set to `1`, the paired gate also fails unless at least one scenario is faster:
+/// the merge rule for PRs is "no regression, and measurably faster than the base".
+const REQUIRE_FASTER_ENV: &str = "SPLITHELLO_BENCH_REQUIRE_FASTER";
 /// A regression fails the gate only when the whole 95% CI of the median change is above it.
 const REGRESSION_GATE: f64 = 0.05;
 const NOISE: f64 = 0.01;
@@ -726,7 +729,8 @@ struct PairedResult {
 }
 
 /// Measures base and HEAD in alternating rounds (A B B A A B …) and prints the gate table.
-/// Exits non-zero when a scenario regressed beyond [`REGRESSION_GATE`].
+/// Exits non-zero when a scenario regressed beyond [`REGRESSION_GATE`], or, with
+/// [`REQUIRE_FASTER_ENV`], when no scenario got faster.
 fn paired_compare(base_binary: &Path) {
     let runtime = runtime();
     let head_binary = head_binary();
@@ -779,15 +783,73 @@ fn paired_compare(base_binary: &Path) {
         });
     }
 
-    let regressed = print_paired_table(&results);
+    let verdicts = print_paired_table(&results);
     write_paired_json(&results);
+    let regressed = verdicts.names(Verdict::Regressed);
+    let faster = verdicts.names(Verdict::Faster);
+    let require_faster = std::env::var_os(REQUIRE_FASTER_ENV).is_some_and(|value| value == "1");
+    println!();
     if !regressed.is_empty() {
-        eprintln!(
-            "regressed beyond {:.0}%: {}",
+        println!(
+            "**Gate: FAIL**: regressed beyond {:.0}%: {}",
             REGRESSION_GATE * 100.0,
             regressed.join(", ")
         );
         std::process::exit(1);
+    }
+    if require_faster && faster.is_empty() {
+        println!("**Gate: FAIL**: no scenario is faster than the base (95% CI below -1%)");
+        std::process::exit(1);
+    }
+    let faster = if faster.is_empty() {
+        "none".to_owned()
+    } else {
+        faster.join(", ")
+    };
+    println!("**Gate: PASS**: no regression; faster: {faster}");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Verdict {
+    Regressed,
+    Slower,
+    Same,
+    Faster,
+}
+
+impl Verdict {
+    /// `lower`/`upper` bound the 95% CI of the median change (HEAD / base − 1).
+    fn from_change_ci(lower: f64, upper: f64) -> Self {
+        if lower > REGRESSION_GATE {
+            Self::Regressed
+        } else if lower > NOISE {
+            Self::Slower
+        } else if upper < -NOISE {
+            Self::Faster
+        } else {
+            Self::Same
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Regressed => "❌ regressed",
+            Self::Slower => "slower",
+            Self::Same => "≈ same",
+            Self::Faster => "✅ faster",
+        }
+    }
+}
+
+struct Verdicts(Vec<(&'static str, Verdict)>);
+
+impl Verdicts {
+    fn names(&self, verdict: Verdict) -> Vec<&'static str> {
+        self.0
+            .iter()
+            .filter(|(_, candidate)| *candidate == verdict)
+            .map(|(name, _)| *name)
+            .collect()
     }
 }
 
@@ -849,32 +911,25 @@ fn format_sample(scenario: Scenario, ns: f64) -> String {
     }
 }
 
-fn print_paired_table(results: &[PairedResult]) -> Vec<&'static str> {
-    let mut regressed = Vec::new();
+fn print_paired_table(results: &[PairedResult]) -> Verdicts {
+    let mut verdicts = Vec::new();
     println!();
     println!("| Scenario | base (median) | HEAD (median) | Δ median | 95% CI | Verdict |");
     println!("|---|---|---|---|---|---|");
     for result in results {
         let (ratio, lower, upper) = ratio_with_ci(&result.base, &result.head);
         let (change, lower, upper) = (ratio - 1.0, lower - 1.0, upper - 1.0);
-        let verdict = if lower > REGRESSION_GATE {
-            regressed.push(result.scenario.name());
-            "❌ regressed"
-        } else if lower > NOISE {
-            "slower"
-        } else if upper < -NOISE {
-            "✅ faster"
-        } else {
-            "≈ same"
-        };
+        let verdict = Verdict::from_change_ci(lower, upper);
+        verdicts.push((result.scenario.name(), verdict));
         println!(
-            "| `{}` | {} | {} | {:+.1}% | [{:+.1}%, {:+.1}%] | {verdict} |",
+            "| `{}` | {} | {} | {:+.1}% | [{:+.1}%, {:+.1}%] | {} |",
             result.scenario.name(),
             format_sample(result.scenario, median(&mut result.base.clone())),
             format_sample(result.scenario, median(&mut result.head.clone())),
             change * 100.0,
             lower * 100.0,
             upper * 100.0,
+            verdict.label(),
         );
         if let (Some(base), Some(head)) = (result.base_doh_per_burst, result.head_doh_per_burst) {
             println!(
@@ -883,7 +938,7 @@ fn print_paired_table(results: &[PairedResult]) -> Vec<&'static str> {
             );
         }
     }
-    regressed
+    Verdicts(verdicts)
 }
 
 fn write_paired_json(results: &[PairedResult]) {

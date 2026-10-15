@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # Merge rule: a PR may merge only when it is measurably faster than its base branch and
+  # no scenario regresses. Base and PR binaries are measured in alternating rounds on the
+  # same runner, so runner-to-runner speed differences cancel out (see benches/BASELINE.md).
+  # macOS because the harness paces tunnels for macOS loopback TIME_WAIT (2×MSL = 30 s).
+  bench-gate:
+    if: github.event_name == 'pull_request'
+    needs: check
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Paired benchmark against the base branch
+        env:
+          SPLITHELLO_BENCH_REQUIRE_FASTER: "1"
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          set -o pipefail
+          scripts/bench.sh compare "$BASE_REF" | tee bench-gate.md
+      - name: Publish gate table
+        if: always()
+        run: |
+          {
+            echo "### Benchmark gate vs \`${{ github.base_ref }}\`"
+            cat bench-gate.md 2>/dev/null || echo "no results"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-gate
+          path: |
+            bench-gate.md
+            target/criterion/paired.json
