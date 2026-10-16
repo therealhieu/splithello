@@ -35,32 +35,52 @@ Keep it running while you browse. A ready banner (`outcome=ready` when piped) me
 
 To stop, press `Ctrl-C` and remove the browser's proxy or PAC setting. SplitHello makes no persistent network, firewall, resolver, or certificate changes.
 
-### Check on or stop a running SplitHello
+### Run in the background
 
-From any terminal:
-
-```sh
-splithello status         # pid, uptime, addresses, open tunnels, totals; exits 3 when not running
-splithello stop           # lets open tunnels finish (up to limits.shutdown_timeout), then exits
-splithello stop --force   # exits at once, for an instance that does not answer
-```
+`splithello start -d` returns once the proxy is ready and keeps it running after the terminal closes:
 
 ```text
+$ splithello start -d
+SplitHello 0.1.0 ready
+  proxy  127.0.0.1:8080   browser HTTPS proxy
+  pac    http://127.0.0.1:8081/proxy.pac   or this PAC URL
+  dns    1.1.1.1 (DoH)   2 target(s)
+running in the background · pid 4242
+  logs   splithello logs -f   (~/.local/state/splithello/splithello.log)
+  stop   splithello stop
+```
+
+If it cannot start (a busy port, say), `start -d` prints the reason and its last log lines, and nothing is left running. From any terminal:
+
+| Command | Effect |
+|---|---|
+| `splithello status` | pid, uptime, addresses, log, open tunnels, and totals; exits 3 when not running |
+| `splithello logs` / `logs -f` / `logs -n 200` | The last 50 log lines / then follow new ones / the last 200 |
+| `splithello restart` | Stops and starts it again in the background with the same config, log, and `-v`/`-q`/`--log-format`; use after editing the config or `splithello update` |
+| `splithello stop` | Lets open tunnels finish (up to `limits.shutdown_timeout`), then exits |
+| `splithello stop --force` | Exits at once, for an instance that does not answer |
+
+```text
+$ splithello status
 SplitHello 0.1.0 running · pid 4242 · up 2h 3m 4s
   proxy    127.0.0.1:8080
   pac      http://127.0.0.1:8081/proxy.pac
   config   /home/me/.config/splithello/config.toml
+  log      /home/me/.local/state/splithello/splithello.log  (splithello logs -f)
   tunnels  2 open · 120 split, 340 direct, 3 failed since start
 ```
 
-Only one SplitHello runs per user: a second `start` stops with `SplitHello is already running (pid …)`. The running instance keeps two files in `~/.local/state/splithello/` (`$XDG_STATE_HOME` if set):
+`status` and `stop` also work on a SplitHello started in the foreground. Only one runs per user: a second `start` stops with `SplitHello is already running (pid …)`. Its files live in `~/.local/state/splithello/` (`$XDG_STATE_HOME` if set):
 
 | File | Content |
 |---|---|
 | `splithello.lock` | Empty. Locked while SplitHello runs; the lock goes away with the process, even after a crash. |
-| `run.toml` | Its pid, addresses, config path, and a random control token. Owner-only; removed when it exits. |
+| `run.toml` | Its pid, addresses, config and log paths, and a random control token. Owner-only; removed when it exits. |
+| `splithello.log`, `splithello.log.1` | The background log (human format; `--log-format logfmt` for machines) and the previous run's. `start --log-file <PATH>` writes elsewhere. |
 
-`stop` and `status` reach SplitHello over a loopback port that answers only to that token. On macOS and Linux, `SIGTERM` stops it the same way.
+`stop`, `status`, and `restart` reach SplitHello over a loopback port that answers only to that token; on macOS and Linux, `SIGTERM` stops it the same way. On Windows, Ctrl-C cannot reach a background SplitHello: use `splithello stop`.
+
+A background SplitHello does not survive logging out or restarting the computer. On Linux, systemd may also end it at logout (`KillUserProcesses=yes`).
 
 ### Use another config file
 
@@ -114,7 +134,7 @@ splithello update --version v0.2.0    # a specific release, also an older one or
 
 | Installed with | `splithello update` |
 |---|---|
-| Release archive | downloads the release for this platform, verifies its SHA-256 digest, runs it once, then replaces the binary in place; restart `start` afterwards |
+| Release archive | downloads the release for this platform, verifies its SHA-256 digest, runs it once, then replaces the binary in place; `splithello restart` switches a running SplitHello to it |
 | Homebrew | prints `brew upgrade splithello` |
 | Cargo | prints `cargo install splithello --locked` |
 

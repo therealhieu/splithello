@@ -23,6 +23,7 @@ use crate::control::ControlToken;
 
 const LOCK_FILE: &str = "splithello.lock";
 const RUN_FILE: &str = "run.toml";
+const LOG_FILE: &str = "splithello.log";
 const RUN_FORMAT: u32 = 1;
 /// `status` and `stop` probe with a brief shared lock; a starting instance waits this long
 /// for such a probe to let go (and, on Windows, for a dead holder's lock to be released).
@@ -57,7 +58,7 @@ fn pid_suffix(pid: Option<u32>) -> String {
 }
 
 impl InstanceError {
-    fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Self {
+    pub(crate) fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Self {
         let path = path.to_path_buf();
         move |source| Self::Io {
             action,
@@ -104,6 +105,15 @@ impl StatePaths {
     pub(crate) fn run(&self) -> PathBuf {
         self.dir.join(RUN_FILE)
     }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where `start -d` logs unless `--log-file` says otherwise.
+    pub(crate) fn log(&self) -> PathBuf {
+        self.dir.join(LOG_FILE)
+    }
 }
 
 /// What `status` and `stop` need to find and address the running instance.
@@ -120,6 +130,12 @@ pub(crate) struct RunRecord {
     pub(crate) pac: Option<String>,
     pub(crate) control: SocketAddr,
     pub(crate) token: ControlToken,
+    /// The log file; absent when it logs to the terminal it was started in.
+    #[serde(default)]
+    pub(crate) log: Option<PathBuf>,
+    /// The `-v`/`-q`/`--log-format` flags it was started with, for `restart`.
+    #[serde(default)]
+    pub(crate) flags: Vec<String>,
 }
 
 impl RunRecord {
@@ -142,6 +158,8 @@ impl RunRecord {
             pac,
             control,
             token,
+            log: None,
+            flags: Vec::new(),
         }
     }
 }
@@ -293,7 +311,7 @@ fn remove_if_present(path: &Path) -> Result<bool, InstanceError> {
 
 /// Owner-only on Unix: `run.toml` holds the control token. On Windows the files inherit the
 /// user profile's owner-only access.
-fn create_private_dir(dir: &Path) -> Result<(), InstanceError> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), InstanceError> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::default_cache_path;
 use crate::config::{Config, ConfigError};
 use crate::control::{ControlError, ControlServer, ControlToken};
+use crate::daemon::DaemonError;
 use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
 use crate::domain::{DomainError, DomainName};
@@ -30,6 +31,21 @@ pub(crate) struct ReadyMetadata {
 }
 
 impl ReadyMetadata {
+    /// For `start -d`, which announces readiness on behalf of the background process.
+    pub(crate) fn new(
+        proxy_addr: SocketAddr,
+        pac_url: Option<String>,
+        target_count: usize,
+        doh_host: &str,
+    ) -> Self {
+        Self {
+            proxy_addr,
+            pac_url,
+            target_count,
+            doh_host: doh_host.to_owned(),
+        }
+    }
+
     pub(crate) fn proxy_addr(&self) -> SocketAddr {
         self.proxy_addr
     }
@@ -85,13 +101,13 @@ pub(crate) enum AppError {
     Resolver(#[source] ResolveError),
     #[error("could not compile target policy")]
     Domain(#[source] DomainError),
-    #[error("could not bind proxy listener {address}")]
+    #[error("could not bind proxy listener {address}: {source}")]
     ProxyBind {
         address: SocketAddr,
         #[source]
         source: std::io::Error,
     },
-    #[error("could not bind PAC listener {address}")]
+    #[error("could not bind PAC listener {address}: {source}")]
     PacBind {
         address: SocketAddr,
         #[source]
@@ -111,6 +127,8 @@ pub(crate) enum AppError {
     Instance(#[from] InstanceError),
     #[error(transparent)]
     Control(#[from] ControlError),
+    #[error(transparent)]
+    Daemon(#[from] DaemonError),
     #[error("SplitHello is starting but has not said how to reach it yet")]
     Starting,
     #[error("SplitHello (pid {pid}) is still running after {}", humantime::format_duration(*.waited))]
@@ -147,6 +165,7 @@ impl AppError {
                 Outcome::InternalError
             }
             Self::Control(_) => Outcome::ConnectError,
+            Self::Daemon(_) => Outcome::InternalError,
             Self::Starting | Self::StillRunning { .. } | Self::Kill { .. } => {
                 Outcome::InternalError
             }
@@ -165,6 +184,11 @@ impl AppError {
                 Some(hint) => Some(hint),
                 None => self.outcome().hint(),
             },
+            Self::Daemon(error) => error.hint(),
+            Self::ProxyBind { .. } | Self::PacBind { .. } => Some(
+                "another program uses that port; stop it, or set [proxy].listen / [proxy].pac \
+                 to a free one",
+            ),
             Self::Control(ControlError::Rejected(_)) => Some(
                 "run.toml does not match the running instance; \
                  `splithello stop --force` stops it anyway",

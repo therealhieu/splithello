@@ -18,6 +18,7 @@ use crate::app::AppError;
 use crate::cli::UpdateArgs;
 use crate::config::{Config, DnsConfig};
 use crate::dns::{DohReqwestResolver, DohResolver};
+use crate::instance::{self, Liveness, StatePaths};
 
 pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Set to anything but empty or `0` to turn the automatic check off.
@@ -369,9 +370,20 @@ pub(crate) async fn run_command(args: &UpdateArgs) -> Result<bool, AppError> {
 
     println!("downloading splithello {target} …");
     match source.install(tag.as_deref(), None).await? {
-        Some(installed) => println!(
-            "updated {CURRENT_VERSION} → {installed}; restart `splithello start` to use it"
-        ),
+        Some(installed) => {
+            let running = StatePaths::from_env()
+                .ok()
+                .and_then(|paths| instance::probe(&paths).ok())
+                .is_some_and(|liveness| matches!(liveness, Liveness::Running(_)));
+            if running {
+                println!(
+                    "updated {CURRENT_VERSION} → {installed}; `splithello restart` switches the \
+                     running SplitHello to it"
+                );
+            } else {
+                println!("updated {CURRENT_VERSION} → {installed}");
+            }
+        }
         None => println!("splithello {CURRENT_VERSION} is up to date"),
     }
     Ok(true)

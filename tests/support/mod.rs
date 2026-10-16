@@ -822,7 +822,7 @@ fn wait_for_captured_output(output: &Arc<Mutex<String>>, needle: &str) -> String
     }
 }
 
-fn parse_ready_socket(output: &str, prefix: &str) -> Option<SocketAddr> {
+pub fn parse_ready_socket(output: &str, prefix: &str) -> Option<SocketAddr> {
     let start = output.find(prefix)? + prefix.len();
     let value = output[start..]
         .split(|character: char| character.is_ascii_whitespace() || character == '/')

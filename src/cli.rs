@@ -50,6 +50,11 @@ pub(crate) enum Command {
     Status,
     /// Stop the running SplitHello after it drains open tunnels, as Ctrl-C would.
     Stop(StopArgs),
+    /// Stop SplitHello and start it again in the background with the same configuration
+    /// and log flags, e.g. after editing the config or `splithello update`.
+    Restart(ConfigArgs),
+    /// Print the background instance's log.
+    Logs(LogsArgs),
     /// Validate the configuration, check listeners, and resolve every target over DoH.
     Check(ConfigArgs),
     /// Replace this binary with the newest release; Homebrew and Cargo installs print their
@@ -61,6 +66,34 @@ pub(crate) enum Command {
 pub(crate) struct StartArgs {
     #[command(flatten)]
     pub(crate) config: ConfigArgs,
+    /// Run in the background and return once the proxy is ready; logs go to a file
+    /// (`splithello logs`), and `splithello stop` stops it.
+    #[arg(short, long)]
+    pub(crate) detach: bool,
+    /// Write logs to PATH instead of the terminal; the previous run's log moves to PATH.1.
+    /// With -d: [default: $XDG_STATE_HOME/splithello/splithello.log, else
+    /// ~/.local/state/splithello/splithello.log]
+    #[arg(long, value_name = "PATH")]
+    pub(crate) log_file: Option<PathBuf>,
+    /// Set by `start -d` on the process it starts.
+    #[arg(long, hide = true, requires = "log_file", conflicts_with = "detach")]
+    pub(crate) detached_child: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct LogsArgs {
+    /// Keep printing new lines as they are written, until Ctrl-C.
+    #[arg(short, long)]
+    pub(crate) follow: bool,
+    /// How many of the last lines to print first.
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 50,
+        value_parser = clap::value_parser!(u16).range(1..=10_000),
+        value_name = "N"
+    )]
+    pub(crate) lines: u16,
 }
 
 #[derive(Debug, Args)]
