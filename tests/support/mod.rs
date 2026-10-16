@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record, RecordType};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -645,6 +648,9 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut ca_params = CertificateParams::new(vec!["SplitHello test CA".to_owned()])
         .expect("create CA parameters");
+    // Distinct subjects: rcgen's default would make the server certificate's issuer equal
+    // its subject, and Windows then checks it as self-signed and rejects its signature.
+    ca_params.distinguished_name = common_name("SplitHello test CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -664,8 +670,13 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
-    let server_params =
-        CertificateParams::new(names).expect("create server certificate parameters");
+    let mut server_params =
+        CertificateParams::new(names.clone()).expect("create server certificate parameters");
+    server_params.distinguished_name = common_name(
+        names
+            .first()
+            .map_or("SplitHello test server", String::as_str),
+    );
     let server_key = KeyPair::generate().expect("generate server key");
     let server_cert = server_params
         .signed_by(&server_key, &issuer)
@@ -681,6 +692,12 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
         ca_der,
         server,
     }
+}
+
+fn common_name(name: &str) -> DistinguishedName {
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, name);
+    distinguished_name
 }
 
 async fn sleep_rtt(duration: Duration) {
