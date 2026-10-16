@@ -1,6 +1,6 @@
 [package]
 name = "splithello"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 edition = "2024"
 description = "Local HTTPS CONNECT proxy that splits the TLS ClientHello for selected sites, with DNS over HTTPS"
 license = "MIT"
