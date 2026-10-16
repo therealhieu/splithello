@@ -65,6 +65,17 @@ $linux_intel
     bin.install "splithello"
   end
 
+  # \`brew services start splithello\`: runs at login. Restarted only after a crash (launchd), so a
+  # config error stops it instead of looping; systemd's restart limit ends such a loop on Linux.
+  # The marker lets \`splithello stop\` point to \`brew services stop\` instead.
+  service do
+    run [opt_bin/"splithello", "start", "--log-file", var/"log/splithello.log"]
+    environment_variables SPLITHELLO_MANAGED_BY: "homebrew"
+    keep_alive crashed: true
+    log_path var/"log/splithello.log"
+    error_log_path var/"log/splithello.log"
+  end
+
   test do
     assert_equal "splithello #{version}", shell_output("#{bin}/splithello --version").strip
   end

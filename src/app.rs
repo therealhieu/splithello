@@ -133,6 +133,11 @@ pub(crate) enum AppError {
     Starting,
     #[error("SplitHello (pid {pid}) is still running after {}", humantime::format_duration(*.waited))]
     StillRunning { pid: u32, waited: Duration },
+    #[error(
+        "SplitHello runs as a {} service, which would start it again",
+        crate::instance::manager_name(.manager)
+    )]
+    Managed { manager: String, restart: bool },
     #[error("could not stop SplitHello (pid {pid})")]
     Kill {
         pid: u32,
@@ -169,13 +174,23 @@ impl AppError {
             Self::Starting | Self::StillRunning { .. } | Self::Kill { .. } => {
                 Outcome::InternalError
             }
+            Self::Managed { .. } => Outcome::ConfigError,
             Self::Update(_) => Outcome::ConnectError,
         }
     }
 
     /// What the user can do about it; the outcome's hint unless the error knows better.
-    pub(crate) const fn hint(&self) -> Option<&'static str> {
+    pub(crate) fn hint(&self) -> Option<&'static str> {
         match self {
+            Self::Managed { manager, restart } => Some(match (manager.as_str(), restart) {
+                ("homebrew", false) => {
+                    "`brew services stop splithello`; or `splithello stop --force` until it is \
+                     started again"
+                }
+                ("homebrew", true) => "`brew services restart splithello`",
+                (_, false) => "stop it through that service manager, or `splithello stop --force`",
+                (_, true) => "restart it through that service manager",
+            }),
             Self::Update(_) => Some(
                 "check the connection, or download the release from \
                  https://github.com/therealhieu/splithello/releases",
