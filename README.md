@@ -133,10 +133,12 @@ The DoH endpoint host must be bootstrap-reachable without resolving any configur
 |---|---|---|
 | `outcome=target-transformed` | `✓ split` | A target used DoH and ClientHello splitting. |
 | `outcome=direct-relay` | `· direct` (with `-v`) | A non-target used normal system resolution and unchanged relay. |
-| `outcome=dns-error` | `✗ dns` | DoH failed or returned no valid IPv4 address. |
-| `outcome=connect-error` | `✗ connect` | The proxy could not connect to the listener or origin. |
+| `outcome=dns-error` | `✗ dns` | DoH failed or returned no valid IPv4 address, and no answer from the last 10 minutes could stand in. The line shows the underlying error. |
+| `outcome=connect-error` | `✗ connect` | The proxy could not connect to the origin, or the connection broke before the site replied (as an injected reset does). The line shows the underlying error. |
 | `outcome=tls-error` | `✗ tls` | The ClientHello was incomplete, invalid, or did not match the CONNECT host. |
 | `outcome=timeout` | `✗ timeout` | A configured deadline expired. |
+| `outcome=peer-reset` | `· reset` (non-targets with `-v`) | The browser or site hung up abruptly after the site had replied, e.g. a spare parallel connection or a WebSocket reconnect. The line names the side and the OS error. |
+| `outcome=idle-timeout` | `· idle` (non-targets with `-v`) | A tunnel carried no traffic for `limits.idle_timeout` and was closed. Normal for browser keep-alive connections. |
 | `outcome=unsupported-request` | `✗ request` | The request was not a supported hostname-form HTTP/1.1 CONNECT request. |
 
 ### Limits

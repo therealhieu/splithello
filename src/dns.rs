@@ -21,6 +21,10 @@ use crate::{config::DnsConfig, diagnostics::Outcome, domain::DomainName};
 const MAX_CNAME_HOPS: usize = 8;
 const DOH_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DOH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long past its TTL an answer may still be served when DoH fails (RFC 8767). CDN
+/// hosts publish TTLs under a minute, so a brief DoH outage would otherwise fail every
+/// new tunnel to a site that resolved moments ago.
+const STALE_WINDOW: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DnsAnswer {
@@ -86,6 +90,16 @@ impl ResolveError {
         }
     }
 
+    /// Whether a stale cached answer may stand in for this failure. A definite NXDOMAIN
+    /// means the name is gone, so it is not papered over.
+    fn allows_stale(&self) -> bool {
+        match self {
+            Self::ResponseCode(ResponseCode::NXDomain) => false,
+            Self::Shared(error) => error.allows_stale(),
+            _ => true,
+        }
+    }
+
     pub(crate) fn is_timeout(&self) -> bool {
         match self {
             Self::Timeout => true,
@@ -121,13 +135,14 @@ impl DnsCache {
         }
     }
 
+    /// Returns a fresh (unexpired) answer. An expired one stays stored for
+    /// [`Self::get_stale`] until it leaves the stale window.
     pub(crate) fn get(&mut self, host: &DomainName, now: Instant) -> Option<Vec<Ipv4Addr>> {
-        let expired = self
-            .entries
-            .get(host)
-            .is_some_and(|entry| now >= entry.expires_at);
-        if expired {
-            self.entries.remove(host);
+        let entry = self.entries.get(host)?;
+        if now >= entry.expires_at {
+            if now >= entry.expires_at + STALE_WINDOW {
+                self.entries.remove(host);
+            }
             return None;
         }
 
@@ -138,14 +153,20 @@ impl DnsCache {
         })
     }
 
+    /// Returns an answer that expired less than [`STALE_WINDOW`] ago, for use only when a
+    /// fresh lookup failed.
+    pub(crate) fn get_stale(&self, host: &DomainName, now: Instant) -> Option<Vec<Ipv4Addr>> {
+        self.entries
+            .get(host)
+            .filter(|entry| now < entry.expires_at + STALE_WINDOW)
+            .map(|entry| entry.addrs.clone())
+    }
+
+    /// Stores an answer. A zero TTL is never served fresh but still backs a stale fallback.
     pub(crate) fn insert(&mut self, host: DomainName, answer: &DnsAnswer, now: Instant) {
         let ttl = answer.ttl.min(self.max_ttl);
-        if ttl.is_zero() {
-            self.entries.remove(&host);
-            return;
-        }
-
-        self.entries.retain(|_, entry| now < entry.expires_at);
+        self.entries
+            .retain(|_, entry| now < entry.expires_at + STALE_WINDOW);
         if !self.entries.contains_key(&host) && self.entries.len() >= self.capacity {
             let victim = self
                 .entries
@@ -340,6 +361,14 @@ impl DohResolver {
             .get(host, Instant::now()))
     }
 
+    fn stale(&self, host: &DomainName) -> Result<Option<Vec<Ipv4Addr>>, ResolveError> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| ResolveError::CacheUnavailable)?
+            .get_stale(host, Instant::now()))
+    }
+
     /// Queries DoH and caches a success. Runs once per in-flight host.
     async fn query_and_cache(&self, host: &DomainName) -> Result<Vec<Ipv4Addr>, ResolveError> {
         let answer = self.query_a(host).await?;
@@ -434,8 +463,22 @@ impl TargetResolver for DohResolver {
                 }
             }
             drop(flight);
-            // A lone lookup gets its original error back; shared failures stay shared.
-            result.map_err(|error| Arc::try_unwrap(error).unwrap_or_else(ResolveError::Shared))
+            let error = match result {
+                Ok(addrs) => return Ok(addrs),
+                // A lone lookup gets its original error back; shared failures stay shared.
+                Err(error) => Arc::try_unwrap(error).unwrap_or_else(ResolveError::Shared),
+            };
+            if error.allows_stale()
+                && let Some(stale) = self.stale(host)?
+            {
+                tracing::warn!(
+                    host = %host,
+                    error = %crate::diagnostics::error_chain(&error),
+                    "DoH lookup failed; using the last known addresses"
+                );
+                return Ok(stale);
+            }
+            Err(error)
         })
     }
 }
@@ -571,8 +614,9 @@ mod tests {
     use crate::domain::DomainName;
 
     use super::{
-        DnsAnswer, DnsCache, DohResolver, MAX_CNAME_HOPS, ResolveError, TargetResolver,
-        build_a_query, build_authenticated_client, collect_system_addresses, parse_a_response,
+        DnsAnswer, DnsCache, DohResolver, MAX_CNAME_HOPS, ResolveError, STALE_WINDOW,
+        TargetResolver, build_a_query, build_authenticated_client, collect_system_addresses,
+        parse_a_response,
     };
 
     fn build_test_client() -> reqwest::Client {
@@ -996,6 +1040,99 @@ mod tests {
         assert!(resolver.in_flight.lock().unwrap().is_empty());
     }
 
+    /// A DoH server whose first answer is 203.0.113.20 with a zero TTL (cached, never
+    /// fresh) and whose later answers carry `later_rcode` and no records.
+    async fn flaky_doh(later_rcode: ResponseCode) -> reqwest::Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for query_index in 0.. {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, content_length) = loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = std::str::from_utf8(&request[..end])
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map(|value| value.trim().parse::<usize>().unwrap())
+                        .unwrap();
+                    break (end + 4, length);
+                };
+                while request.len() < header_end + content_length {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let query =
+                    Message::from_vec(&request[header_end..header_end + content_length]).unwrap();
+                let mut response = Message::new(
+                    query.metadata.id,
+                    MessageType::Response,
+                    hickory_proto::op::OpCode::Query,
+                );
+                response.add_query(query.queries[0].clone());
+                if query_index == 0 {
+                    response.add_answer(Record::from_rdata(
+                        query.queries[0].name().clone(),
+                        0,
+                        RData::A(A::new(203, 0, 113, 20)),
+                    ));
+                } else {
+                    response.metadata.response_code = later_rcode;
+                }
+                let body = response.to_vec().unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        reqwest::Url::parse(&format!("http://{address}/dns-query")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_lookup_falls_back_to_the_last_known_addresses() {
+        let resolver = counting_resolver(flaky_doh(ResponseCode::ServFail).await);
+        let expected = vec![Ipv4Addr::new(203, 0, 113, 20)];
+        assert_eq!(
+            resolver.resolve_ipv4(&host("reddit.com")).await.unwrap(),
+            expected
+        );
+        // The zero-TTL answer is not fresh, so this queries again, gets SERVFAIL, and
+        // serves the stale answer instead of failing the tunnel.
+        assert_eq!(
+            resolver.resolve_ipv4(&host("reddit.com")).await.unwrap(),
+            expected
+        );
+        // A host never resolved before has nothing stale to fall back to.
+        assert!(matches!(
+            resolver.resolve_ipv4(&host("medium.com")).await,
+            Err(ResolveError::ResponseCode(ResponseCode::ServFail))
+        ));
+    }
+
+    #[tokio::test]
+    async fn nxdomain_is_not_papered_over_with_a_stale_answer() {
+        let resolver = counting_resolver(flaky_doh(ResponseCode::NXDomain).await);
+        resolver.resolve_ipv4(&host("reddit.com")).await.unwrap();
+        assert!(matches!(
+            resolver.resolve_ipv4(&host("reddit.com")).await,
+            Err(ResolveError::ResponseCode(ResponseCode::NXDomain))
+        ));
+    }
+
     #[tokio::test]
     async fn doh_does_not_follow_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1158,5 +1295,32 @@ mod tests {
                 .get(&host("c.example"), start + Duration::from_secs(19))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn expired_answers_stay_available_as_stale_until_the_window_ends() {
+        let start = std::time::Instant::now();
+        let mut cache = DnsCache::new(4, Duration::from_secs(300));
+        let answer = |ttl| DnsAnswer {
+            addrs: vec![Ipv4Addr::new(203, 0, 113, 1)],
+            ttl: Duration::from_secs(ttl),
+        };
+        cache.insert(host("a.example"), &answer(10), start);
+        cache.insert(host("zero.example"), &answer(0), start);
+
+        assert!(cache.get(&host("zero.example"), start).is_none());
+        assert!(cache.get_stale(&host("zero.example"), start).is_some());
+
+        let expired = start + Duration::from_secs(10);
+        assert!(cache.get(&host("a.example"), expired).is_none());
+        assert_eq!(
+            cache.get_stale(&host("a.example"), expired),
+            Some(vec![Ipv4Addr::new(203, 0, 113, 1)])
+        );
+
+        let past_window = expired + STALE_WINDOW;
+        assert!(cache.get_stale(&host("a.example"), past_window).is_none());
+        assert!(cache.get(&host("a.example"), past_window).is_none());
+        assert!(!cache.entries.contains_key(&host("a.example")));
     }
 }

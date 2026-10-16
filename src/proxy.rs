@@ -582,7 +582,8 @@ async fn handle_client_with_permit(
                 error.outcome(),
                 started,
                 RelayStats::default(),
-            ));
+            )
+            .with_error(&error));
         }
         Err(_) => {
             let _ = write_http_status(&mut client, 504, &cancel).await;
@@ -618,8 +619,12 @@ async fn handle_client_with_permit(
         &cancel,
     )
     .await;
-    let outcome = result.map_or_else(relay_outcome, |()| Outcome::DirectRelay);
-    Ok(report(request, false, outcome, started, stats))
+    let outcome = match &result {
+        Ok(()) => Outcome::DirectRelay,
+        Err(error) => relay_end_outcome(error, &stats),
+    };
+    let report = report(request, false, outcome, started, stats);
+    Ok(with_relay_error(report, &result))
 }
 
 async fn handle_target(
@@ -653,7 +658,8 @@ async fn handle_target(
                 error.outcome(),
                 started,
                 RelayStats::default(),
-            ));
+            )
+            .with_error(&error));
         }
         Err(_) => {
             let _ = write_http_status(&mut client, 504, &cancel).await;
@@ -713,14 +719,9 @@ async fn handle_target(
     let prefix_len = prefix.len() as u64;
     let prefix_deadline = Instant::now() + state.limits.idle_timeout;
     if let Err(error) = write_relay_bytes(&mut upstream, &prefix, prefix_deadline, &cancel).await {
-        let outcome = relay_outcome(error);
-        return Ok(report(
-            request,
-            true,
-            outcome,
-            started,
-            RelayStats::default(),
-        ));
+        let outcome = relay_outcome(&error);
+        let report = report(request, true, outcome, started, RelayStats::default());
+        return Ok(with_relay_error(report, &Err(error)));
     }
     let (mut stats, result) = relay_streams(
         &mut client,
@@ -729,13 +730,14 @@ async fn handle_target(
         &cancel,
     )
     .await;
-    let outcome = match result {
+    let outcome = match &result {
         Ok(()) if transformed => Outcome::TargetTransformed,
         Ok(()) => Outcome::DirectRelay,
-        Err(error) => relay_outcome(error),
+        Err(error) => relay_end_outcome(error, &stats),
     };
     stats.bytes_up = stats.bytes_up.saturating_add(prefix_len);
-    Ok(report(request, true, outcome, started, stats))
+    let report = report(request, true, outcome, started, stats);
+    Ok(with_relay_error(report, &result))
 }
 
 enum PrefixDecision {
@@ -788,11 +790,31 @@ async fn decide_client_hello_prefix(
     }
 }
 
-fn relay_outcome(error: RelayError) -> Outcome {
+/// How an established relay ended. Its only timeout is the idle watchdog, so that is an
+/// idle close rather than a failed deadline. An I/O error after the site has replied is a
+/// peer hanging up (a spare browser connection, a WebSocket reconnect); one before any
+/// reply stays a connect failure, since that is how a reset injected on the path looks.
+fn relay_end_outcome(error: &RelayError, stats: &RelayStats) -> Outcome {
+    match error {
+        RelayError::Timeout => Outcome::Idle,
+        RelayError::Io { .. } if stats.bytes_down > 0 => Outcome::Reset,
+        error => relay_outcome(error),
+    }
+}
+
+fn relay_outcome(error: &RelayError) -> Outcome {
     match error {
         RelayError::Cancelled => Outcome::Cancelled,
         RelayError::Timeout => Outcome::Timeout,
-        RelayError::Io => Outcome::ConnectError,
+        RelayError::Io { .. } => Outcome::ConnectError,
+    }
+}
+
+/// Attaches an I/O failure's cause to the report; cancels and timeouts explain themselves.
+fn with_relay_error(report: TunnelReport, result: &Result<(), RelayError>) -> TunnelReport {
+    match result {
+        Err(error @ RelayError::Io { .. }) => report.with_error(error),
+        _ => report,
     }
 }
 
@@ -863,11 +885,26 @@ async fn write_http_status(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Error)]
 enum RelayError {
+    #[error("relay cancelled")]
     Cancelled,
+    #[error("relay idle timeout")]
     Timeout,
-    Io,
+    /// e.g. "reading from the site: Connection reset by peer (os error 54)".
+    #[error("{op} the {peer}")]
+    Io {
+        op: &'static str,
+        peer: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl RelayError {
+    fn io(op: &'static str, peer: &'static str) -> impl FnOnce(std::io::Error) -> Self {
+        move |source| Self::Io { op, peer, source }
+    }
 }
 
 /// Relays both directions until each side has sent EOF, or until cancel, an I/O error,
@@ -889,8 +926,22 @@ async fn relay_streams(
     let bytes_down = AtomicU64::new(0);
     let both_directions = async {
         tokio::try_join!(
-            relay_direction(client_read, upstream_write, &bytes_up, &activity),
-            relay_direction(upstream_read, client_write, &bytes_down, &activity),
+            relay_direction(
+                client_read,
+                "browser",
+                upstream_write,
+                "site",
+                &bytes_up,
+                &activity
+            ),
+            relay_direction(
+                upstream_read,
+                "site",
+                client_write,
+                "browser",
+                &bytes_down,
+                &activity
+            ),
         )
     };
     let result = tokio::select! {
@@ -907,7 +958,9 @@ async fn relay_streams(
 
 async fn relay_direction<R, W>(
     mut reader: R,
+    from: &'static str,
     mut writer: W,
+    to: &'static str,
     bytes: &AtomicU64,
     activity: &RelayActivity,
 ) -> Result<(), RelayError>
@@ -917,15 +970,21 @@ where
 {
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     loop {
-        let read = reader.read(&mut buffer).await.map_err(|_| RelayError::Io)?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(RelayError::io("reading from", from))?;
         if read == 0 {
-            return writer.shutdown().await.map_err(|_| RelayError::Io);
+            return writer
+                .shutdown()
+                .await
+                .map_err(RelayError::io("closing the connection to", to));
         }
         activity.touch();
         writer
             .write_all(&buffer[..read])
             .await
-            .map_err(|_| RelayError::Io)?;
+            .map_err(RelayError::io("writing to", to))?;
         bytes.fetch_add(read as u64, Ordering::Relaxed);
         activity.touch();
     }
@@ -974,7 +1033,7 @@ async fn write_relay_bytes<W: tokio::io::AsyncWrite + Unpin>(
         _ = cancel.cancelled() => Err(RelayError::Cancelled),
         result = timeout_at(deadline, writer.write_all(bytes)) => match result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(RelayError::Io),
+            Ok(Err(source)) => Err(RelayError::Io { op: "writing to", peer: "site", source }),
             Err(_) => Err(RelayError::Timeout),
         }
     }
@@ -1745,6 +1804,91 @@ mod tests {
         accept.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn reset_after_the_site_replied_is_a_peer_reset_naming_the_side() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut client_peer, mut client) = socket_pair(&listener).await;
+        let (mut upstream_peer, mut upstream) = socket_pair(&listener).await;
+        let relay = tokio::spawn(async move {
+            super::relay_streams(
+                &mut client,
+                &mut upstream,
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await
+        });
+
+        upstream_peer.write_all(b"hello").await.unwrap();
+        let mut hello = [0_u8; 5];
+        client_peer.read_exact(&mut hello).await.unwrap();
+        // Zero linger turns the close into a TCP RST, as a site or middlebox reset does.
+        upstream_peer.set_zero_linger().unwrap();
+        drop(upstream_peer);
+
+        let (stats, result) = timeout(Duration::from_secs(5), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                super::RelayError::Io {
+                    op: "reading from",
+                    peer: "site",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(stats.bytes_down, 5);
+        assert_eq!(
+            super::relay_end_outcome(&error, &stats),
+            crate::diagnostics::Outcome::Reset
+        );
+        let report = super::with_relay_error(
+            super::report(
+                parse_connect(b"CONNECT reddit.com:443 HTTP/1.1\r\n\r\n", &allowed_ports())
+                    .unwrap(),
+                true,
+                crate::diagnostics::Outcome::Reset,
+                std::time::Instant::now(),
+                stats,
+            ),
+            &Err(error),
+        );
+        assert!(
+            report
+                .error()
+                .unwrap()
+                .starts_with("reading from the site: "),
+            "{:?}",
+            report.error()
+        );
+    }
+
+    #[test]
+    fn io_error_before_any_reply_stays_a_connect_failure() {
+        let reset = || super::RelayError::Io {
+            op: "reading from",
+            peer: "site",
+            source: std::io::ErrorKind::ConnectionReset.into(),
+        };
+        let silent = super::RelayStats {
+            bytes_up: 1_900,
+            bytes_down: 0,
+        };
+        assert_eq!(
+            super::relay_end_outcome(&reset(), &silent),
+            crate::diagnostics::Outcome::ConnectError
+        );
+        assert_eq!(
+            super::relay_end_outcome(&super::RelayError::Timeout, &silent),
+            crate::diagnostics::Outcome::Idle
+        );
+    }
+
     async fn socket_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
         let (accepted, connected) = tokio::join!(
             listener.accept(),
@@ -1793,7 +1937,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(result, Err(super::RelayError::Timeout));
+        assert!(matches!(result, Err(super::RelayError::Timeout)));
         assert_eq!(stats.bytes_up, 4);
         assert!(stats.bytes_down > 0);
     }
