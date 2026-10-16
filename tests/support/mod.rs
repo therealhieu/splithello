@@ -435,12 +435,14 @@ impl RunningSplitHello {
     /// started without waiting, like a signal.
     #[cfg(not(unix))]
     pub fn interrupt(&mut self) {
-        self.command()
+        let mut stop = self
+            .command()
             .arg("stop")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start splithello stop");
+        std::thread::spawn(move || stop.wait());
     }
 
     #[cfg(unix)]

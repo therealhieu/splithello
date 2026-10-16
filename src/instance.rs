@@ -303,11 +303,16 @@ fn create_private_dir(dir: &Path) -> Result<(), InstanceError> {
         .map_err(InstanceError::io("create", dir))
 }
 
-fn private_options() -> OpenOptions {
+#[cfg(unix)]
+pub(crate) fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options
+}
+
+#[cfg(not(unix))]
+pub(crate) fn private_options() -> OpenOptions {
+    OpenOptions::new()
 }
 
 #[cfg(test)]
