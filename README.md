@@ -16,6 +16,24 @@ Archives cover macOS, Linux (glibc 2.35+) and Windows, each on x86_64 and ARM64.
 
 Installed this way, run `splithello start` in the steps below instead of `./target/release/splithello start`.
 
+### Update
+
+`splithello start` and `splithello check` say when a newer release exists. Install it with:
+
+```sh
+splithello update            # asks first; --yes skips the question
+splithello update --check    # only report
+splithello update --version v0.2.0   # a specific release, also an older one or a prerelease
+```
+
+| Installed with | `splithello update` |
+|---|---|
+| Release archive | downloads the release for this platform, verifies its SHA-256 digest, runs it once, then replaces the binary in place; restart `start` afterwards |
+| Homebrew | prints `brew upgrade splithello` |
+| Cargo | prints `cargo install splithello --locked` |
+
+The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set). It never delays startup. Turn it off with `[update] check = false` in the config or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
+
 ## Run
 
 1. Build and start. The first run creates `~/.config/splithello/config.toml` and stops.
@@ -60,6 +78,7 @@ SplitHello 0.1.0 ready
   dns    1.1.1.1 (DoH)   2 target(s)
 21:22:10 ✓ split    www.reddit.com                 397ms  ↑596B ↓13K
 21:22:11 ✗ dns      old.reddit.com                 DoH request timed out → check that [dns].upstream is reachable (`splithello check`)
+21:22:15 ↑ update   0.2.0 available (you have 0.1.0) → splithello update
 21:23:10 · last 1m: 37 tunnels (12 split, 24 direct, 1 failed) · 6 active
 ```
 
@@ -131,7 +150,7 @@ The DoH endpoint host must be bootstrap-reachable without resolving any configur
 
 ### Stop
 
-Stop the process with `Ctrl-C`, then remove the HTTPS proxy or PAC setting. SplitHello leaves no persistent network, firewall, resolver, or certificate changes.
+Stop the process with `Ctrl-C`, then remove the HTTPS proxy or PAC setting. SplitHello leaves no persistent network, firewall, resolver, or certificate changes. Its only other file is the update-check cache, `~/.cache/splithello/update-check.toml`, which is safe to delete.
 
 ### Development checks
 

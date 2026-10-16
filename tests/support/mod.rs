@@ -350,6 +350,9 @@ impl RunningSplitHello {
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", rust_log)
+            // Tests and benchmarks stay off GitHub and out of the real cache directory.
+            .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
+            .env("XDG_CACHE_HOME", directory.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

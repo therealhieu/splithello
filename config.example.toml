@@ -33,3 +33,9 @@ cache_size = 256
 # shutdown_timeout = "10s"
 # max_connect_header_bytes = 16384
 # max_client_hello_bytes = 262144
+
+# `start` and `check` ask GitHub for the latest release at most once a day and say when
+# a newer one exists; `splithello update` installs it. SPLITHELLO_NO_UPDATE_CHECK=1 also
+# turns the check off.
+# [update]
+# check = true
