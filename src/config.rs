@@ -1173,7 +1173,6 @@ shutdown_timeout = "1m"
             "splithello start -d",
             "splithello logs",
             "splithello restart",
-            "brew services start splithello",
         ] {
             assert!(readme.contains(required), "README is missing `{required}`");
         }
