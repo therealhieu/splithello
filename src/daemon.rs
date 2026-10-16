@@ -124,7 +124,10 @@ pub(crate) async fn start_detached(
         if let Some(status) = child.try_wait().map_err(DaemonError::Spawn)? {
             // Lost a race with another `start`: say who won rather than how this one failed.
             if let Liveness::Running(record) = instance::probe(&paths)? {
-                return Err(InstanceError::already_running(Some(&record)).into());
+                return Err(InstanceError::AlreadyRunning {
+                    pid: Some(record.pid),
+                }
+                .into());
             }
             report_failure(&log, &stderr);
             return Err(DaemonError::ExitedEarly(status).into());
@@ -142,8 +145,10 @@ pub(crate) async fn start_detached(
 pub(crate) fn refuse_if_running(paths: &StatePaths) -> Result<(), InstanceError> {
     match instance::probe(paths)? {
         Liveness::NotRunning { .. } => Ok(()),
-        Liveness::Starting => Err(InstanceError::already_running(None)),
-        Liveness::Running(record) => Err(InstanceError::already_running(Some(&record))),
+        Liveness::Starting => Err(InstanceError::AlreadyRunning { pid: None }),
+        Liveness::Running(record) => Err(InstanceError::AlreadyRunning {
+            pid: Some(record.pid),
+        }),
     }
 }
 

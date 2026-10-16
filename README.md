@@ -80,16 +80,7 @@ SplitHello 0.1.0 running · pid 4242 · up 2h 3m 4s
 
 `stop`, `status`, and `restart` reach SplitHello over a loopback port that answers only to that token; on macOS and Linux, `SIGTERM` stops it the same way. On Windows, Ctrl-C cannot reach a background SplitHello: use `splithello stop`.
 
-A background SplitHello does not survive logging out or restarting the computer. On Linux, systemd may also end it at logout (`KillUserProcesses=yes`). To start it at login, use a service:
-
-### Start at login (Homebrew)
-
-```sh
-brew services start splithello   # now and at every login; restarted if it crashes
-brew services stop splithello
-```
-
-The service runs `splithello start` with the default config and logs to `$(brew --prefix)/var/log/splithello.log`; `splithello status` and `splithello logs` work as usual. `splithello stop` and `restart` point to `brew services` instead, since Homebrew would start it again. A config error stops the service rather than restarting it; fix the config and run `brew services restart splithello`. The service does not see variables exported in your shell, so it uses `~/.config` and `~/.local/state` unless `XDG_CONFIG_HOME`/`XDG_STATE_HOME` are set system-wide.
+A background SplitHello does not survive logging out or restarting the computer. On Linux, systemd may also end it at logout (`KillUserProcesses=yes`).
 
 ### Use another config file
 
@@ -133,7 +124,15 @@ SplitHello 0.1.0 ready
 
 ## Update
 
-`splithello start` and `splithello check` say when a newer release exists. Install it with:
+SplitHello says when a newer release exists:
+
+| Where | How |
+|---|---|
+| `splithello start` | logs `↑ update` a few seconds after startup, then daily |
+| `splithello status`, `splithello check` | an `update` row |
+| `splithello start -d`, `stop`, `restart` | a last line on the terminal (stderr, not with `-q`), so a background instance's notice is not left in its log: `↑ splithello 0.2.0 is available (you have 0.1.0) → brew upgrade splithello` |
+
+Install it with:
 
 ```sh
 splithello update                     # asks first; --yes skips the question
@@ -147,7 +146,7 @@ splithello update --version v0.2.0    # a specific release, also an older one or
 | Homebrew | prints `brew upgrade splithello` |
 | Cargo | prints `cargo install splithello --locked` |
 
-The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set; safe to delete). It never delays startup. Turn it off with `[update] check = false` in the config or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
+The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set; safe to delete). It never delays startup, and the commands above only read that file. Turn it off with `[update] check = false` in the config (the next `start` or `check` deletes the file) or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
 
 ## Explanations
 

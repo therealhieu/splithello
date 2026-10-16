@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 use crate::app::{AppError, Runtime};
-use crate::cli::{ConfigArgs, StartArgs, StopArgs, default_cache_path};
+use crate::cli::{ConfigArgs, StartArgs, StopArgs};
 use crate::control::{self, ControlError, ControlToken, Reply, Verb};
 use crate::daemon;
 use crate::instance::{self, Instance, InstanceError, Liveness, RunRecord, StatePaths};
@@ -100,7 +100,6 @@ pub(crate) async fn start(
     };
     record.log = log;
     record.flags = options.flags();
-    record.managed_by = instance::managed_by(|key| std::env::var_os(key));
     if let Err(error) = instance.publish(&record) {
         let _ = runtime.shutdown().await;
         return Err(error.into());
@@ -108,6 +107,8 @@ pub(crate) async fn start(
     runtime.ready().emit();
     if check_updates {
         runtime.spawn_update_notifier();
+    } else {
+        update::forget_cached();
     }
     let run_result = runtime.run_until_signal().await;
     let shutdown_result = runtime.shutdown().await;
@@ -165,11 +166,7 @@ pub(crate) async fn status() -> Result<CommandStatus, AppError> {
         Liveness::Running(record) => record,
     };
     let live = control::request(record.control, &record.token, Verb::Status).await;
-    let latest = update::check_enabled(true)
-        .then(|| default_cache_path(update::CACHE_FILE))
-        .flatten()
-        .and_then(|cache| update::cached_latest(&cache))
-        .filter(|latest| update::is_newer(latest));
+    let latest = update::pending_update();
     print!(
         "{}",
         render_status(&record, live.as_ref(), unix_now(), latest.as_deref())
@@ -193,9 +190,6 @@ fn render_status(
     row("proxy", &record.proxy.to_string());
     row("pac", record.pac.as_deref().unwrap_or("disabled"));
     row("config", &record.config.display().to_string());
-    if let Some(manager) = &record.managed_by {
-        row("managed", instance::manager_name(manager));
-    }
     match &record.log {
         Some(log) => row("log", &format!("{}  (splithello logs -f)", log.display())),
         None => row("log", "the terminal it was started in"),
@@ -247,19 +241,6 @@ pub(crate) async fn stop(args: &StopArgs) -> Result<CommandStatus, AppError> {
         }
         return Ok(CommandStatus::Success);
     };
-    if let Some(manager) = &record.managed_by {
-        // Stopping it here would only make the service manager start it again.
-        if !args.force {
-            return Err(AppError::Managed {
-                manager: manager.clone(),
-                restart: false,
-            });
-        }
-        println!(
-            "warning: {} may start SplitHello again",
-            instance::manager_name(manager)
-        );
-    }
     stop_instance(&paths, &record, args.force).await?;
     println!("stopped");
     let proxy = match &record.pac {
@@ -315,15 +296,6 @@ pub(crate) async fn restart(
 ) -> Result<CommandStatus, AppError> {
     let paths = StatePaths::from_env()?;
     let previous = running_record(&paths).await?;
-    if let Some(manager) = previous
-        .as_ref()
-        .and_then(|record| record.managed_by.clone())
-    {
-        return Err(AppError::Managed {
-            manager,
-            restart: true,
-        });
-    }
     let explicit_flags = options.flags();
     let (config, flags, log) = match &previous {
         Some(record) => (

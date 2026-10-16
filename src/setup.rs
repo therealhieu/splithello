@@ -136,6 +136,7 @@ pub(crate) async fn check(path: &Path, config: &Config) -> Result<bool, AppError
 
 async fn release_status(config: &Config, resolver: Arc<DohResolver>) -> String {
     if !update::check_enabled(config.update().check()) {
+        update::forget_cached();
         return "· update check off".to_owned();
     }
     let source = match ReleaseSource::github(resolver) {
