@@ -125,7 +125,7 @@ Browser                 SplitHello              DoH Server       Website
 
 Targets are defined by `targets` in the config. The example includes `reddit.com`, `medium.com`, and their subdomains; `{ host = "example.com", subdomains = false }` matches one exact host. The PAC file sends only those targets through SplitHello.
 
-The DoH endpoint host must be bootstrap-reachable without resolving any configured selected or blocked domain. Prefer a literal-IP HTTPS endpoint whose certificate is valid for that IP, or an independently resolvable non-target hostname. HTTPS certificate authentication is mandatory. `dns.ca_certificate` may add trusted CA roots but never disables verification.
+The DoH endpoint host must be bootstrap-reachable without resolving any configured selected or blocked domain. Prefer a literal-IP HTTPS endpoint whose certificate is valid for that IP, or an independently resolvable non-target hostname. HTTPS certificate authentication is mandatory. `dns.ca_certificate` may add trusted CA roots but never disables verification. The DoH connection uses X25519 key exchange only: post-quantum key shares make the TLS ClientHello larger than one TCP segment, and some networks reset those to public DoH resolvers.
 
 ### Outcomes
 

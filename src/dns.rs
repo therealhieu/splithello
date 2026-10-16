@@ -62,6 +62,8 @@ pub(crate) enum ResolveError {
     Client(#[source] reqwest::Error),
     #[error("additional DoH CA certificate is not valid PEM")]
     InvalidCaCertificate,
+    #[error("could not build DoH TLS configuration")]
+    Tls(#[source] rustls::Error),
     #[error("DoH request timed out")]
     Timeout,
     #[error("DoH request failed")]
@@ -512,8 +514,8 @@ fn build_authenticated_client(
     additional_ca_pem: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<reqwest::Client, ResolveError> {
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(doh_tls_config(additional_ca_pem)?)
         .https_only(true)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -524,16 +526,47 @@ fn build_authenticated_client(
         // TLS handshake (~100-200 ms to a public resolver) before the first lookup.
         .pool_idle_timeout(DOH_POOL_IDLE_TIMEOUT)
         .http2_keep_alive_interval(DOH_KEEP_ALIVE_INTERVAL)
-        .http2_keep_alive_while_idle(true);
-    if let Some(pem) = additional_ca_pem {
-        let certificates = reqwest::tls::Certificate::from_pem_bundle(pem)
-            .map_err(|_| ResolveError::InvalidCaCertificate)?;
-        if certificates.is_empty() {
-            return Err(ResolveError::InvalidCaCertificate);
+        .http2_keep_alive_while_idle(true)
+        .build()
+        .map_err(ResolveError::Client)
+}
+
+/// The DoH client's TLS: reqwest's own setup (aws-lc-rs, TLS 1.2 + 1.3, the platform
+/// verifier plus any extra roots, ALPN h2 + http/1.1) with key exchange limited to X25519.
+///
+/// The default groups include X25519MLKEM768. Its ~1.2 KB key share, plus a session
+/// ticket, pushes the ClientHello past one TCP segment (~1460 B), and some networks reset
+/// such ClientHellos to public DoH resolvers. rustls remembers the server's preferred
+/// group per host, so once 1.1.1.1 has picked X25519MLKEM768, every later connection sent
+/// the large ClientHello and was reset until restart. With X25519 alone the ClientHello
+/// stays ~250 B (~500 B resumed). The cost is no post-quantum key exchange for DoH.
+fn doh_tls_config(additional_ca_pem: Option<&[u8]>) -> Result<rustls::ClientConfig, ResolveError> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+    let provider = Arc::new(provider);
+    let verifier = match additional_ca_pem {
+        None => rustls_platform_verifier::Verifier::new(Arc::clone(&provider)),
+        Some(pem) => {
+            let roots = CertificateDer::pem_slice_iter(pem)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ResolveError::InvalidCaCertificate)?;
+            if roots.is_empty() {
+                return Err(ResolveError::InvalidCaCertificate);
+            }
+            rustls_platform_verifier::Verifier::new_with_extra_roots(roots, Arc::clone(&provider))
         }
-        builder = builder.tls_certs_merge(certificates);
     }
-    builder.build().map_err(ResolveError::Client)
+    .map_err(ResolveError::Tls)?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(ResolveError::Tls)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 fn map_request_error(error: reqwest::Error) -> ResolveError {
@@ -1226,6 +1259,50 @@ mod tests {
             Err(ResolveError::ResponseTooLarge)
         ));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn doh_tls_offers_only_x25519_with_h2_and_http1_alpn() {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        for extra_roots in [None, Some(generated.cert.pem())] {
+            let config = super::doh_tls_config(extra_roots.as_deref().map(str::as_bytes)).unwrap();
+            let groups = config
+                .crypto_provider()
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>();
+            assert_eq!(groups, [rustls::NamedGroup::X25519]);
+            assert_eq!(
+                config.alpn_protocols,
+                [b"h2".to_vec(), b"http/1.1".to_vec()]
+            );
+        }
+    }
+
+    /// The reset that motivated X25519-only hit ClientHellos larger than one TCP segment.
+    #[tokio::test]
+    async fn doh_client_hello_fits_well_inside_one_tcp_segment() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; 5];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x16, "first record must be a handshake");
+            usize::from(u16::from_be_bytes([header[3], header[4]])) + header.len()
+        });
+        let client = build_authenticated_client(None, Duration::from_secs(2)).unwrap();
+        let _ = client
+            .post(format!("https://{address}/dns-query"))
+            .send()
+            .await;
+
+        let record_bytes = server.await.unwrap();
+        assert!(
+            record_bytes <= 512,
+            "ClientHello record is {record_bytes} B; one TCP segment carries ~1460 B"
+        );
     }
 
     #[test]
