@@ -127,8 +127,8 @@ impl ReleaseSource {
         })
     }
 
-    /// A plain-HTTP source for a local fake of GitHub's API.
-    #[cfg(test)]
+    /// A plain-HTTP source for a local fake of GitHub's API; its tests build Unix archives.
+    #[cfg(all(test, unix))]
     fn local(api_base: String) -> Self {
         Self {
             client: reqwest::Client::builder()
