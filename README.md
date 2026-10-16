@@ -133,7 +133,15 @@ SplitHello 0.1.0 ready
 
 ## Update
 
-`splithello start` and `splithello check` say when a newer release exists. Install it with:
+SplitHello says when a newer release exists:
+
+| Where | How |
+|---|---|
+| `splithello start` | logs `↑ update` a few seconds after startup, then daily |
+| `splithello status`, `splithello check` | an `update` row |
+| `splithello start -d`, `stop`, `restart` | a last line on the terminal (stderr, not with `-q`), so a background instance's notice is not left in its log: `↑ splithello 0.2.0 is available (you have 0.1.0) → brew upgrade splithello` |
+
+Install it with:
 
 ```sh
 splithello update                     # asks first; --yes skips the question
@@ -147,7 +155,7 @@ splithello update --version v0.2.0    # a specific release, also an older one or
 | Homebrew | prints `brew upgrade splithello` |
 | Cargo | prints `cargo install splithello --locked` |
 
-The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set; safe to delete). It never delays startup. Turn it off with `[update] check = false` in the config or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
+The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set; safe to delete). It never delays startup, and the commands above only read that file. Turn it off with `[update] check = false` in the config (the next `start` or `check` deletes the file) or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
 
 ## Explanations
 

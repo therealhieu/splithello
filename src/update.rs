@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::AppError;
-use crate::cli::UpdateArgs;
+use crate::cli::{UpdateArgs, default_cache_path};
 use crate::config::{Config, DnsConfig};
 use crate::dns::{DohReqwestResolver, DohResolver};
 use crate::instance::{self, Liveness, StatePaths};
@@ -233,6 +233,39 @@ pub(crate) fn cached_latest(path: &Path) -> Option<String> {
     read_cache(path).map(|entry| entry.latest)
 }
 
+/// A newer release the last check found, read from the cache without asking GitHub.
+pub(crate) fn pending_update() -> Option<String> {
+    check_enabled(true)
+        .then(|| default_cache_path(CACHE_FILE))
+        .flatten()
+        .and_then(|cache| pending_in(&cache))
+}
+
+fn pending_in(cache: &Path) -> Option<String> {
+    cached_latest(cache).filter(|latest| is_newer(latest))
+}
+
+/// The line short commands end with on a terminal when [`pending_update`] finds a release.
+pub(crate) fn notice(latest: &str, method: InstallMethod) -> String {
+    format!(
+        "↑ splithello {latest} is available (you have {CURRENT_VERSION}) → {}",
+        method.upgrade_command()
+    )
+}
+
+/// Drops the cached answer, so a check turned off in the config leaves no notice behind.
+pub(crate) fn forget_cached() {
+    let Some(path) = default_cache_path(CACHE_FILE) else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %path.display(), error = %error, "update cache not removed");
+        }
+        _ => {}
+    }
+}
+
 fn read_cache(path: &Path) -> Option<CacheEntry> {
     toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
@@ -420,7 +453,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CHECK_INTERVAL, CacheEntry, InstallMethod, is_newer, opted_out, read_cache, write_cache,
+        CHECK_INTERVAL, CURRENT_VERSION, CacheEntry, InstallMethod, is_newer, notice, opted_out,
+        pending_in, read_cache, write_cache,
     };
 
     #[test]
@@ -487,6 +521,30 @@ mod tests {
 
         std::fs::write(&path, "checked_at = \"yesterday\"").unwrap();
         assert_eq!(read_cache(&path), None, "a corrupt cache reads as none");
+    }
+
+    #[test]
+    fn only_a_cached_newer_release_is_pending() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("update-check.toml");
+        assert_eq!(pending_in(&path), None, "no cache, no notice");
+
+        let cache = |latest: &str| CacheEntry {
+            checked_at: 1_000_000,
+            latest: latest.to_owned(),
+        };
+        write_cache(&path, &cache(CURRENT_VERSION)).unwrap();
+        assert_eq!(pending_in(&path), None, "already on the cached release");
+        // Age does not matter: a release seen a week ago is still newer.
+        write_cache(&path, &cache("999.0.0")).unwrap();
+        assert_eq!(pending_in(&path).as_deref(), Some("999.0.0"));
+
+        assert_eq!(
+            notice("999.0.0", InstallMethod::Homebrew),
+            format!(
+                "↑ splithello 999.0.0 is available (you have {CURRENT_VERSION}) → brew upgrade splithello"
+            )
+        );
     }
 
     /// Serves GitHub's release endpoints for one fake `v9.9.9` release whose archive holds a

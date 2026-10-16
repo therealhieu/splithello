@@ -15,7 +15,7 @@ mod setup;
 mod tls;
 mod update;
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -36,8 +36,14 @@ async fn main() -> ExitCode {
         logging::init(&cli.log_options(), LogTarget::Stdout);
     }
     let starting = matches!(cli.command, Command::Start(_));
+    let update_notice = !cli.quiet && ends_with_update_notice(&cli.command);
     match run(cli).await {
-        Ok(status) => status.into(),
+        Ok(status) => {
+            if update_notice {
+                print_update_notice();
+            }
+            status.into()
+        }
         Err(error) if !tracing::dispatcher::has_been_set() => {
             // Failed before its log file was open: stderr is all there is (for `start -d`,
             // the parent shows it).
@@ -87,6 +93,31 @@ async fn run(cli: Cli) -> Result<CommandStatus, AppError> {
             setup::check(&path, &config).await.map(CommandStatus::from)
         }
         Command::Update(args) => update::run_command(&args).await.map(CommandStatus::from),
+    }
+}
+
+/// Short commands that do not report releases themselves; `status`, `check`, `update`, and a
+/// running `start`'s log already do.
+fn ends_with_update_notice(command: &Command) -> bool {
+    match command {
+        Command::Stop(_) | Command::Restart(_) => true,
+        Command::Start(args) => args.detach,
+        Command::Status | Command::Logs(_) | Command::Check(_) | Command::Update(_) => false,
+    }
+}
+
+/// On stderr and only on a terminal, so scripts and pipes never see it.
+fn print_update_notice() {
+    let mut stderr = std::io::stderr();
+    if !stderr.is_terminal() {
+        return;
+    }
+    if let Some(latest) = update::pending_update() {
+        let _ = writeln!(
+            stderr,
+            "\n{}",
+            update::notice(&latest, update::InstallMethod::current())
+        );
     }
 }
 

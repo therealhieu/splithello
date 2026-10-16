@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 use crate::app::{AppError, Runtime};
-use crate::cli::{ConfigArgs, StartArgs, StopArgs, default_cache_path};
+use crate::cli::{ConfigArgs, StartArgs, StopArgs};
 use crate::control::{self, ControlError, ControlToken, Reply, Verb};
 use crate::daemon;
 use crate::instance::{self, Instance, InstanceError, Liveness, RunRecord, StatePaths};
@@ -108,6 +108,8 @@ pub(crate) async fn start(
     runtime.ready().emit();
     if check_updates {
         runtime.spawn_update_notifier();
+    } else {
+        update::forget_cached();
     }
     let run_result = runtime.run_until_signal().await;
     let shutdown_result = runtime.shutdown().await;
@@ -165,11 +167,7 @@ pub(crate) async fn status() -> Result<CommandStatus, AppError> {
         Liveness::Running(record) => record,
     };
     let live = control::request(record.control, &record.token, Verb::Status).await;
-    let latest = update::check_enabled(true)
-        .then(|| default_cache_path(update::CACHE_FILE))
-        .flatten()
-        .and_then(|cache| update::cached_latest(&cache))
-        .filter(|latest| update::is_newer(latest));
+    let latest = update::pending_update();
     print!(
         "{}",
         render_status(&record, live.as_ref(), unix_now(), latest.as_deref())
