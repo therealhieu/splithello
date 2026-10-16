@@ -171,6 +171,7 @@ fn spawn_detached(command: &mut Command) -> std::io::Result<Child> {
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const ERROR_ACCESS_DENIED: i32 = 5;
 
+    keep_std_handles_from_children();
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
     match command.spawn() {
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
@@ -183,6 +184,29 @@ fn spawn_detached(command: &mut Command) -> std::io::Result<Child> {
             Ok(child)
         }
         result => result,
+    }
+}
+
+/// `CreateProcess` hands a child every inheritable handle, not only its stdio. Our own
+/// stdout and stderr are inheritable when the caller gave us pipes, so the instance would
+/// hold them open and `splithello start -d | …` would never see EOF. Unix closes them on
+/// exec; here they have to be marked. `Stdio::inherit` duplicates the handle it passes, so
+/// later spawns are unaffected. `tests/background.rs` reads `start -d` through pipes.
+#[cfg(windows)]
+fn keep_std_handles_from_children() {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in handles.into_iter().filter(|handle| !handle.is_null()) {
+        // SAFETY: a standard handle of this process stays open for its lifetime, and
+        // clearing HANDLE_FLAG_INHERIT only changes what `CreateProcess` passes on. Failure
+        // (a console pseudo-handle on old Windows) leaves the handle as it was.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
     }
 }
 

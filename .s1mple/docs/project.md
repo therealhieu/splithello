@@ -141,7 +141,7 @@ The DoH endpoint must be bootstrap-reachable without resolving a configured sele
 
 - Follow [Rust language rules](languages/rust.md) and default rustfmt.
 - Keep the product as one edition-2024 binary with crate-private cohesive modules.
-- Use safe Rust; no `unsafe` is present in the verified implementation.
+- Use safe Rust. The one `unsafe` call clears the inherit flag on the std handles before `start -d` spawns on Windows (`src/daemon.rs`); std has no stable safe API for it.
 - Validate TOML, hostnames, CONNECT requests, DNS messages, and TLS bytes at their boundaries.
 - Keep listeners loopback-only and all sizes, timeouts, cache entries, ports, connections, and tasks bounded.
 - Do not log traffic payloads or secrets.
