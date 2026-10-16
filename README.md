@@ -10,40 +10,20 @@ Inspired by [tuananh/dpi-bypass](https://github.com/tuananh/dpi-bypass).
 |---|---|
 | Homebrew (macOS, Linux) | `brew install therealhieu/tap/splithello` |
 | Cargo | `cargo install splithello --locked` |
-| Release archive | Download `splithello-v<version>-<target>` for your platform from [Releases](https://github.com/therealhieu/splithello/releases), extract it, and put `splithello` on your `PATH` |
+| Release archive | Download `splithello-v<version>-<target>` from [Releases](https://github.com/therealhieu/splithello/releases), extract it, and put `splithello` on your `PATH` |
+| From source (optional) | `cargo build --release`, then use `./target/release/splithello` wherever this README says `splithello` |
 
 Archives cover macOS, Linux (glibc 2.35+) and Windows, each on x86_64 and ARM64. Each release lists their checksums in `SHA256SUMS`, and `gh attestation verify <archive> --repo therealhieu/splithello` confirms an archive was built by this repository's release workflow. On macOS, an archive downloaded with a browser is quarantined; clear it with `xattr -d com.apple.quarantine splithello`.
 
-Installed this way, run `splithello start` in the steps below instead of `./target/release/splithello start`.
-
-### Update
-
-`splithello start` and `splithello check` say when a newer release exists. Install it with:
-
-```sh
-splithello update            # asks first; --yes skips the question
-splithello update --check    # only report
-splithello update --version v0.2.0   # a specific release, also an older one or a prerelease
-```
-
-| Installed with | `splithello update` |
-|---|---|
-| Release archive | downloads the release for this platform, verifies its SHA-256 digest, runs it once, then replaces the binary in place; restart `start` afterwards |
-| Homebrew | prints `brew upgrade splithello` |
-| Cargo | prints `cargo install splithello --locked` |
-
-The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set). It never delays startup. Turn it off with `[update] check = false` in the config or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
-
 ## Run
 
-1. Build and start. The first run creates `~/.config/splithello/config.toml` and stops.
+1. Start once. It creates `~/.config/splithello/config.toml` (`$XDG_CONFIG_HOME` if set) and stops.
 
    ```sh
-   cargo build --release
-   ./target/release/splithello start
+   splithello start
    ```
 
-2. Add your sites to that file, then run `./target/release/splithello start` again.
+2. Add your sites to that file, then run `splithello start` again.
 
    ```toml
    targets = ["reddit.com", "medium.com"]   # subdomains included
@@ -51,12 +31,16 @@ The check asks GitHub's API for the latest release at most once a day, resolving
 
 3. Set your browser's HTTPS proxy to `127.0.0.1:8080`, or its PAC URL to `http://127.0.0.1:8081/proxy.pac`.
 
-Keep it running while you browse. A ready banner (`outcome=ready` when piped) means it started.
+Keep it running while you browse. A ready banner (`outcome=ready` when piped) means it started. `splithello check` validates the config, checks the listeners, and resolves every target over DoH without starting the proxy.
 
-To use another file instead of `~/.config/splithello/config.toml`, pass `--config <PATH>`:
+To stop, press `Ctrl-C` and remove the browser's proxy or PAC setting. SplitHello makes no persistent network, firewall, resolver, or certificate changes.
+
+### Use another config file
+
+Pass `--config <PATH>` to `start`, `check`, or `update`:
 
 ```sh
-./target/release/splithello start --config config.example.toml
+splithello start --config ~/work.toml
 ```
 
 | File at `<PATH>` | Result |
@@ -90,6 +74,24 @@ SplitHello 0.1.0 ready
 | `--log-format human\|logfmt\|auto` | `auto` (default) is human on a terminal, timestamped `key=value` logfmt when piped |
 
 `RUST_LOG` overrides the level flags.
+
+## Update
+
+`splithello start` and `splithello check` say when a newer release exists. Install it with:
+
+```sh
+splithello update                     # asks first; --yes skips the question
+splithello update --check             # only report
+splithello update --version v0.2.0    # a specific release, also an older one or a prerelease
+```
+
+| Installed with | `splithello update` |
+|---|---|
+| Release archive | downloads the release for this platform, verifies its SHA-256 digest, runs it once, then replaces the binary in place; restart `start` afterwards |
+| Homebrew | prints `brew upgrade splithello` |
+| Cargo | prints `cargo install splithello --locked` |
+
+The check asks GitHub's API for the latest release at most once a day, resolving GitHub over the configured DoH upstream, and remembers the answer in `~/.cache/splithello/update-check.toml` (`$XDG_CACHE_HOME` if set; safe to delete). It never delays startup. Turn it off with `[update] check = false` in the config or `SPLITHELLO_NO_UPDATE_CHECK=1`. Prereleases are only installed by `--version`.
 
 ## Explanations
 
@@ -150,11 +152,9 @@ The DoH endpoint host must be bootstrap-reachable without resolving any configur
 - It does not install certificates or terminate browser-to-origin TLS.
 - Successful startup does not prove bypass success. Test the target and check its tunnel outcome.
 
-### Stop
+## Development
 
-Stop the process with `Ctrl-C`, then remove the HTTPS proxy or PAC setting. SplitHello leaves no persistent network, firewall, resolver, or certificate changes. Its only other file is the update-check cache, `~/.cache/splithello/update-check.toml`, which is safe to delete.
-
-### Development checks
+### Checks
 
 ```sh
 cargo fmt --check
