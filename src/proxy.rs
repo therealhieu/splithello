@@ -1451,15 +1451,20 @@ mod tests {
         let mut limits = test_limits();
         limits.connect_timeout = Duration::from_millis(80);
         limits.idle_timeout = Duration::from_secs(1);
-        let state = Arc::new(ProxyState::new(
-            TargetMatcher::new(Vec::new()).unwrap(),
-            Arc::new(CountingResolver {
+        // IPv4 only: `localhost` lists `::1` first on Windows, where a refused loopback
+        // connect takes about two seconds, far past this test's 80 ms deadline.
+        let state = state_with_direct_resolver(
+            Arc::new(TestDirectResolver {
                 calls: Arc::new(AtomicUsize::new(0)),
+                result: DirectResolverResult::Addresses(vec![SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    origin_port,
+                ))]),
             }),
-            [origin_port],
+            origin_port,
             limits,
             1,
-        ));
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let cancel = CancellationToken::new();
