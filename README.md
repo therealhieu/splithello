@@ -4,6 +4,18 @@ SplitHello is a local HTTPS CONNECT proxy for selected websites. It uses authent
 
 Inspired by [tuananh/dpi-bypass](https://github.com/tuananh/dpi-bypass).
 
+## Install
+
+| Method | Command |
+|---|---|
+| Homebrew (macOS, Linux) | `brew install therealhieu/tap/splithello` |
+| Cargo | `cargo install splithello --locked` |
+| Release archive | Download `splithello-v<version>-<target>` for your platform from [Releases](https://github.com/therealhieu/splithello/releases), extract it, and put `splithello` on your `PATH` |
+
+Archives cover macOS, Linux (glibc 2.35+) and Windows, each on x86_64 and ARM64. Each release lists their checksums in `SHA256SUMS`, and `gh attestation verify <archive> --repo therealhieu/splithello` confirms an archive was built by this repository's release workflow. On macOS, an archive downloaded with a browser is quarantined; clear it with `xattr -d com.apple.quarantine splithello`.
+
+Installed this way, run `splithello start` in the steps below instead of `./target/release/splithello start`.
+
 ## Run
 
 1. Build and start. The first run creates `~/.config/splithello/config.toml` and stops.
