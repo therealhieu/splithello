@@ -304,6 +304,48 @@ fn logs_without_a_background_run_say_so() {
     assert!(printed.contains("splithello start -d"), "{printed}");
 }
 
+/// What `brew services` starts: `stop` and `restart` point to Homebrew instead of fighting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_homebrew_service_is_left_to_homebrew() {
+    let doh = TestDoh::start(DohResponse::Addresses(vec![Ipv4Addr::LOCALHOST])).await;
+    let background = Background::new();
+    let config = background.config(&doh, 443);
+    let start = isolated_command(Path::new(BINARY), background.directory.path())
+        .args(["start", "-d", "--config", &config])
+        .env("SPLITHELLO_MANAGED_BY", "homebrew")
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "{}", text(&start));
+    let pid = background.pid();
+
+    let status = text(&background.run(&["status"]));
+    assert!(
+        status.contains("managed  Homebrew (brew services)"),
+        "{status}"
+    );
+
+    let stop = background.run(&["stop"]);
+    let printed = text(&stop);
+    assert_eq!(stop.status.code(), Some(1), "{printed}");
+    assert!(
+        printed.contains("brew services stop splithello"),
+        "{printed}"
+    );
+    let restart = background.run(&["restart"]);
+    assert!(text(&restart).contains("brew services restart splithello"));
+    let again = text(&background.run(&["start", "-d", "--config", &config]));
+    assert!(
+        again.contains("started by Homebrew (brew services)"),
+        "{again}"
+    );
+    assert_eq!(background.pid(), pid, "still the same instance");
+
+    let force = background.run(&["stop", "--force"]);
+    let printed = text(&force);
+    assert!(force.status.success(), "{printed}");
+    assert!(printed.contains("may start SplitHello again"), "{printed}");
+}
+
 /// A session of its own has no controlling terminal, so closing the terminal sends nothing.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]

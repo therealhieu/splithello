@@ -10,6 +10,7 @@
 //! looking alive, and a leftover `run.toml` is recognizably stale. The lock file itself is
 //! never deleted: removing it would let two processes each lock a different file.
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write as _};
 use std::net::SocketAddr;
@@ -43,8 +44,15 @@ pub(crate) enum InstanceError {
     },
     #[error("{} does not support file locks", path.display())]
     LockUnsupported { path: PathBuf },
-    #[error("SplitHello is already running{}", pid_suffix(*.pid))]
-    AlreadyRunning { pid: Option<u32> },
+    #[error(
+        "SplitHello is already running{}{}",
+        pid_suffix(*.pid),
+        managed_suffix(.managed_by.as_deref())
+    )]
+    AlreadyRunning {
+        pid: Option<u32>,
+        managed_by: Option<String>,
+    },
     #[error("could not record the running instance in {}", path.display())]
     Encode {
         path: PathBuf,
@@ -57,7 +65,21 @@ fn pid_suffix(pid: Option<u32>) -> String {
     pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
+fn managed_suffix(managed_by: Option<&str>) -> String {
+    managed_by
+        .map(|manager| format!(", started by {}", manager_name(manager)))
+        .unwrap_or_default()
+}
+
 impl InstanceError {
+    /// The instance described by `record` (if it has written one yet) holds the lock.
+    pub(crate) fn already_running(record: Option<&RunRecord>) -> Self {
+        Self::AlreadyRunning {
+            pid: record.map(|record| record.pid),
+            managed_by: record.and_then(|record| record.managed_by.clone()),
+        }
+    }
+
     pub(crate) fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Self {
         let path = path.to_path_buf();
         move |source| Self::Io {
@@ -136,6 +158,36 @@ pub(crate) struct RunRecord {
     /// The `-v`/`-q`/`--log-format` flags it was started with, for `restart`.
     #[serde(default)]
     pub(crate) flags: Vec<String>,
+    /// The service manager that started it, e.g. `homebrew`; it restarts what `stop` stops.
+    #[serde(default)]
+    pub(crate) managed_by: Option<String>,
+}
+
+/// Set by a service definition (the Homebrew formula's) on the SplitHello it runs.
+pub(crate) const MANAGED_BY_ENV: &str = "SPLITHELLO_MANAGED_BY";
+
+/// Which service manager started this process, from `env` (the process environment, or a
+/// test's). Only an explicit marker counts, or launchd's label for the Homebrew service:
+/// `XPC_SERVICE_NAME` and systemd's `INVOCATION_ID` are also set in ordinary terminals.
+pub(crate) fn managed_by(env: impl Fn(&str) -> Option<OsString>) -> Option<String> {
+    if let Some(marker) = env(MANAGED_BY_ENV).filter(|marker| !marker.is_empty()) {
+        return Some(marker.to_string_lossy().into_owned());
+    }
+    env("XPC_SERVICE_NAME")
+        .filter(|label| {
+            label
+                .to_string_lossy()
+                .starts_with("homebrew.mxcl.splithello")
+        })
+        .map(|_| "homebrew".to_owned())
+}
+
+/// How `status` and error messages name a service manager.
+pub(crate) fn manager_name(managed_by: &str) -> &str {
+    match managed_by {
+        "homebrew" => "Homebrew (brew services)",
+        other => other,
+    }
 }
 
 impl RunRecord {
@@ -160,6 +212,7 @@ impl RunRecord {
             token,
             log: None,
             flags: Vec::new(),
+            managed_by: None,
         }
     }
 }
@@ -193,9 +246,9 @@ impl Instance {
                     tokio::time::sleep(ACQUIRE_RETRY).await;
                 }
                 Err(TryLockError::WouldBlock) => {
-                    return Err(InstanceError::AlreadyRunning {
-                        pid: read_record(&paths.run()).map(|record| record.pid),
-                    });
+                    return Err(InstanceError::already_running(
+                        read_record(&paths.run()).as_ref(),
+                    ));
                 }
                 Err(TryLockError::Error(error)) if error.kind() == ErrorKind::Unsupported => {
                     return Err(InstanceError::LockUnsupported { path: lock_path });
@@ -379,7 +432,10 @@ mod tests {
         let error = Instance::acquire(paths.clone()).await.unwrap_err();
         assert!(matches!(
             error,
-            InstanceError::AlreadyRunning { pid: Some(42) }
+            InstanceError::AlreadyRunning {
+                pid: Some(42),
+                managed_by: None
+            }
         ));
         assert_eq!(error.to_string(), "SplitHello is already running (pid 42)");
 
@@ -454,6 +510,51 @@ mod tests {
         assert_eq!(toml::from_str::<RunRecord>(&text).unwrap(), record);
         let newer = format!("{text}future_field = 1\n");
         assert_eq!(toml::from_str::<RunRecord>(&newer).unwrap(), record);
+    }
+
+    #[test]
+    fn only_an_explicit_marker_or_the_homebrew_label_means_managed() {
+        use std::ffi::OsString;
+
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(super::managed_by(env(&[])), None);
+        // What ordinary macOS terminals set.
+        assert_eq!(super::managed_by(env(&[("XPC_SERVICE_NAME", "0")])), None);
+        assert_eq!(
+            super::managed_by(env(&[(
+                "XPC_SERVICE_NAME",
+                "application.com.apple.Terminal.1234"
+            )])),
+            None
+        );
+        assert_eq!(
+            super::managed_by(env(&[("XPC_SERVICE_NAME", "homebrew.mxcl.splithello")])),
+            Some("homebrew".to_owned())
+        );
+        assert_eq!(
+            super::managed_by(env(&[("SPLITHELLO_MANAGED_BY", "homebrew")])),
+            Some("homebrew".to_owned())
+        );
+        assert_eq!(
+            super::managed_by(env(&[("SPLITHELLO_MANAGED_BY", "")])),
+            None
+        );
+
+        let error = InstanceError::already_running(Some(&RunRecord {
+            managed_by: Some("homebrew".to_owned()),
+            ..record(5)
+        }));
+        assert_eq!(
+            error.to_string(),
+            "SplitHello is already running (pid 5), started by Homebrew (brew services)"
+        );
     }
 
     #[cfg(unix)]
