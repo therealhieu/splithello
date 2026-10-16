@@ -1,15 +1,19 @@
-//! `start`, `status`, and `stop`: running SplitHello and finding it again afterwards.
+//! `start`, `status`, `stop`, and `restart`: running SplitHello and finding it again
+//! afterwards.
 
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpListener;
 
 use crate::app::{AppError, Runtime};
-use crate::cli::{StartArgs, StopArgs, default_cache_path};
+use crate::cli::{ConfigArgs, StartArgs, StopArgs, default_cache_path};
 use crate::control::{self, ControlError, ControlToken, Reply, Verb};
-use crate::instance::{self, Instance, Liveness, RunRecord, StatePaths};
+use crate::daemon;
+use crate::instance::{self, Instance, InstanceError, Liveness, RunRecord, StatePaths};
+use crate::logging::{self, LogOptions, LogTarget};
 use crate::update::{self, CURRENT_VERSION, InstallMethod};
 use crate::{config_path, load_config};
 
@@ -47,17 +51,39 @@ impl From<CommandStatus> for ExitCode {
     }
 }
 
-/// Runs the proxy in this process until Ctrl-C, SIGTERM, or `splithello stop`.
+/// Runs the proxy in this process until Ctrl-C, SIGTERM, or `splithello stop`; with `-d`,
+/// starts it as a background process instead.
 ///
 /// ```text
-/// lock → config → bind listeners → bind control → write run.toml → ready → … → shutdown
+/// lock → (log file) → config → bind listeners → bind control → write run.toml → ready → …
 /// ```
 ///
 /// `run.toml` is written before the ready line, so whoever sees `ready` can use `status`
-/// and `stop` at once.
-pub(crate) async fn start(args: &StartArgs) -> Result<CommandStatus, AppError> {
+/// and `stop` at once. A log file is opened only once the lock is held, so a second
+/// `start` can never rotate the running instance's log away.
+pub(crate) async fn start(
+    args: &StartArgs,
+    options: &LogOptions,
+) -> Result<CommandStatus, AppError> {
     let path = config_path(&args.config)?;
+    if args.detach {
+        return daemon::start_detached(&path, args.log_file.as_deref(), &options.flags()).await;
+    }
+    // A new session has no controlling terminal, so closing the terminal sends no SIGHUP.
+    #[cfg(unix)]
+    let session = args.detached_child.then(rustix::process::setsid);
     let mut instance = Instance::acquire(StatePaths::from_env()?).await?;
+    let log = match &args.log_file {
+        Some(file) => Some(log_to_file(file, options)?),
+        None => None,
+    };
+    #[cfg(unix)]
+    if let Some(Err(error)) = session {
+        tracing::warn!(
+            error = %std::io::Error::from(error),
+            "could not leave the terminal's session; closing the terminal may stop SplitHello"
+        );
+    }
     let Some(config) = load_config(&path)? else {
         return Ok(CommandStatus::Failed);
     };
@@ -65,9 +91,18 @@ pub(crate) async fn start(args: &StartArgs) -> Result<CommandStatus, AppError> {
     let config_file = std::path::absolute(&path).unwrap_or(path);
 
     let mut runtime = Runtime::start(config).await?;
-    if let Err(error) = publish(&mut runtime, &mut instance, config_file).await {
+    let mut record = match bind_control(&mut runtime, config_file).await {
+        Ok(record) => record,
+        Err(error) => {
+            let _ = runtime.shutdown().await;
+            return Err(error);
+        }
+    };
+    record.log = log;
+    record.flags = options.flags();
+    if let Err(error) = instance.publish(&record) {
         let _ = runtime.shutdown().await;
-        return Err(error);
+        return Err(error.into());
     }
     runtime.ready().emit();
     if check_updates {
@@ -81,11 +116,20 @@ pub(crate) async fn start(args: &StartArgs) -> Result<CommandStatus, AppError> {
         .map(|()| CommandStatus::Success)
 }
 
-async fn publish(
-    runtime: &mut Runtime,
-    instance: &mut Instance,
-    config: std::path::PathBuf,
-) -> Result<(), AppError> {
+/// Starts logging to `file` (moving the previous run's log aside) and returns its absolute
+/// path for `run.toml`.
+fn log_to_file(file: &Path, options: &LogOptions) -> Result<PathBuf, AppError> {
+    let (handle, rotation) = logging::open_log(file).map_err(InstanceError::io("open", file))?;
+    logging::init(options, LogTarget::File(handle));
+    logging::log_panics();
+    if let Some(error) = rotation {
+        tracing::warn!(error = %error, "could not move the previous log aside; appending to it");
+    }
+    Ok(std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()))
+}
+
+/// Starts the control channel and returns the record that tells others how to reach it.
+async fn bind_control(runtime: &mut Runtime, config: PathBuf) -> Result<RunRecord, AppError> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(ControlError::Bind)?;
@@ -100,8 +144,7 @@ async fn publish(
         token.clone(),
     );
     runtime.spawn_control(listener, token);
-    instance.publish(&record)?;
-    Ok(())
+    Ok(record)
 }
 
 pub(crate) async fn status() -> Result<CommandStatus, AppError> {
@@ -149,6 +192,10 @@ fn render_status(
     row("proxy", &record.proxy.to_string());
     row("pac", record.pac.as_deref().unwrap_or("disabled"));
     row("config", &record.config.display().to_string());
+    match &record.log {
+        Some(log) => row("log", &format!("{}  (splithello logs -f)", log.display())),
+        None => row("log", "the terminal it was started in"),
+    }
     match live {
         Ok(reply) => {
             let count = |key| reply.number(key).unwrap_or(0);
@@ -171,7 +218,7 @@ fn render_status(
     if record.version != CURRENT_VERSION {
         row(
             "binary",
-            &format!("{CURRENT_VERSION} is installed; stop and start SplitHello to use it"),
+            &format!("{CURRENT_VERSION} is installed; `splithello restart` to use it"),
         );
     }
     if let Some(latest) = latest {
@@ -196,9 +243,27 @@ pub(crate) async fn stop(args: &StopArgs) -> Result<CommandStatus, AppError> {
         }
         return Ok(CommandStatus::Success);
     };
-    let pid = record.pid;
+    stop_instance(&paths, &record, args.force).await?;
+    println!("stopped");
+    let proxy = match &record.pac {
+        Some(pac) => format!("{} or {pac}", record.proxy),
+        None => record.proxy.to_string(),
+    };
+    println!(
+        "  a browser still set to {proxy} can't open HTTPS sites until SplitHello runs again; \
+         remove that proxy setting to browse without it"
+    );
+    Ok(CommandStatus::Success)
+}
 
-    let wait = if args.force {
+/// Stops the instance `record` describes and waits until it is gone.
+async fn stop_instance(
+    paths: &StatePaths,
+    record: &RunRecord,
+    force: bool,
+) -> Result<(), AppError> {
+    let pid = record.pid;
+    let wait = if force {
         kill(pid).map_err(|source| AppError::Kill { pid, source })?;
         println!("killed SplitHello (pid {pid})");
         SIGNAL_WAIT
@@ -216,21 +281,50 @@ pub(crate) async fn stop(args: &StopArgs) -> Result<CommandStatus, AppError> {
             Err(error) => return Err(error.into()),
         }
     };
-    wait_until_stopped(&paths, pid, wait).await?;
-    if args.force {
+    wait_until_stopped(paths, pid, wait).await?;
+    if force {
         // A killed instance had no chance to remove it.
-        instance::discard_stale(&paths)?;
+        instance::discard_stale(paths)?;
     }
-    println!("stopped");
-    let proxy = match &record.pac {
-        Some(pac) => format!("{} or {pac}", record.proxy),
-        None => record.proxy.to_string(),
+    Ok(())
+}
+
+/// Stops the running instance and starts it again in the background, with the same config,
+/// log file, and log flags unless given new ones. A config that would not start is
+/// reported before anything is stopped.
+pub(crate) async fn restart(
+    args: &ConfigArgs,
+    options: &LogOptions,
+) -> Result<CommandStatus, AppError> {
+    let paths = StatePaths::from_env()?;
+    let previous = running_record(&paths).await?;
+    let explicit_flags = options.flags();
+    let (config, flags, log) = match &previous {
+        Some(record) => (
+            args.config.clone().unwrap_or_else(|| record.config.clone()),
+            if explicit_flags.is_empty() {
+                record.flags.clone()
+            } else {
+                explicit_flags
+            },
+            record.log.clone(),
+        ),
+        None => (config_path(args)?, explicit_flags, None),
     };
-    println!(
-        "  a browser still set to {proxy} can't open HTTPS sites until SplitHello runs again; \
-         remove that proxy setting to browse without it"
-    );
-    Ok(CommandStatus::Success)
+    if load_config(&config)?.is_none() {
+        return Ok(CommandStatus::Failed);
+    }
+    match &previous {
+        Some(record) => {
+            stop_instance(&paths, record, false).await?;
+            println!("stopped");
+            if record.log.is_none() {
+                println!("  it ran in a terminal; it now runs in the background");
+            }
+        }
+        None => println!("SplitHello was not running; starting it"),
+    }
+    daemon::start_detached(&config, log.as_deref(), &flags).await
 }
 
 /// The running instance's record; waits briefly for one that is still starting.
@@ -347,7 +441,9 @@ mod tests {
     #[test]
     fn status_shows_where_it_runs_and_its_traffic() {
         let reply = Reply::parse("OK pid=4242 active=2 split=120 direct=340 failed=3").unwrap();
-        let text = render_status(&record(), Ok(&reply), 1_000 + 7_384, None);
+        let mut record = record();
+        record.log = Some("/home/me/.local/state/splithello/splithello.log".into());
+        let text = render_status(&record, Ok(&reply), 1_000 + 7_384, None);
         assert_eq!(
             text,
             format!(
@@ -355,8 +451,15 @@ mod tests {
                  \x20 proxy    127.0.0.1:8080\n\
                  \x20 pac      http://127.0.0.1:8081/proxy.pac\n\
                  \x20 config   /home/me/.config/splithello/config.toml\n\
+                 \x20 log      /home/me/.local/state/splithello/splithello.log  (splithello logs -f)\n\
                  \x20 tunnels  2 open · 120 split, 340 direct, 3 failed since start\n"
             )
+        );
+        record.log = None;
+        let text = render_status(&record, Ok(&reply), 1_000, None);
+        assert!(
+            text.contains("  log      the terminal it was started in\n"),
+            "{text}"
         );
     }
 

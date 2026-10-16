@@ -1170,6 +1170,9 @@ shutdown_timeout = "1m"
             "splithello status",
             "splithello stop",
             "SplitHello is already running (pid",
+            "splithello start -d",
+            "splithello logs",
+            "splithello restart",
         ] {
             assert!(readme.contains(required), "README is missing `{required}`");
         }

@@ -1,9 +1,12 @@
-//! Stdout log setup: a readable `human` format for terminals and `logfmt` for pipes,
-//! files, and tests. Both render the same structured events.
+//! Log setup: a readable `human` format for terminals and log files, `logfmt` for pipes
+//! and tests. Both render the same structured events.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
+use std::fs::File;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::ValueEnum;
 use tracing::field::{Field, Visit};
@@ -11,6 +14,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -34,6 +38,27 @@ pub(crate) struct LogOptions {
 }
 
 impl LogOptions {
+    /// The command-line flags that produce these options, so a background instance (and
+    /// `restart`) logs the way its `start` asked.
+    pub(crate) fn flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if self.quiet {
+            flags.push("-q".to_owned());
+        }
+        if self.verbose > 0 {
+            flags.push(format!("-{}", "v".repeat(usize::from(self.verbose))));
+        }
+        if let Some(format) = self
+            .format
+            .to_possible_value()
+            .filter(|_| self.format != LogFormat::Auto)
+        {
+            flags.push("--log-format".to_owned());
+            flags.push(format.get_name().to_owned());
+        }
+        flags
+    }
+
     /// `RUST_LOG` wins. Otherwise SplitHello's own events follow `-q` (warn), default (info),
     /// `-v` (debug), `-vv` (trace); dependencies stay at warn until `-vv` raises them to debug.
     fn filter(&self) -> EnvFilter {
@@ -47,25 +72,73 @@ impl LogOptions {
     }
 }
 
-pub(crate) fn init(options: &LogOptions) {
-    let terminal = std::io::stdout().is_terminal();
+/// Where log lines go: the terminal (or pipe) by default, a file for a background instance.
+pub(crate) enum LogTarget {
+    Stdout,
+    File(File),
+}
+
+pub(crate) fn init(options: &LogOptions, target: LogTarget) {
+    let terminal = matches!(target, LogTarget::Stdout) && std::io::stdout().is_terminal();
+    let file = matches!(target, LogTarget::File(_));
+    // A log file is read by people (`splithello logs`), so `auto` means human there too.
     let human = match options.format {
-        LogFormat::Auto => terminal,
+        LogFormat::Auto => terminal || file,
         LogFormat::Human => true,
         LogFormat::Logfmt => false,
     };
-    let builder = tracing_subscriber::fmt().with_env_filter(options.filter());
+    let writer = match target {
+        LogTarget::Stdout => BoxMakeWriter::new(std::io::stdout),
+        LogTarget::File(file) => BoxMakeWriter::new(Arc::new(file)),
+    };
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(options.filter())
+        .with_writer(writer);
     if human {
         let color = terminal && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
         builder
             .event_format(HumanFormat {
                 color,
-                clock: local_clock,
+                // A background instance runs for days; a bare time of day would be ambiguous.
+                clock: if file { dated_clock } else { local_clock },
             })
             .init();
     } else {
         builder.with_target(false).with_timer(LocalTime).init();
     }
+}
+
+/// Opens `path` for appending, after moving the previous run's log to `<path>.1`, so the
+/// file holds one run and the one before it. Rotation is best effort: when the rename
+/// fails (on Windows another program may hold `<path>.1` open), logging appends instead
+/// and the error is returned for a warning once logging is up.
+pub(crate) fn open_log(path: &Path) -> std::io::Result<(File, Option<std::io::Error>)> {
+    let rotation = match std::fs::rename(path, rotated(path)) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error),
+    };
+    let file = crate::instance::private_options()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    Ok((file, rotation))
+}
+
+/// `<path>.1`, whatever the extension.
+pub(crate) fn rotated(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// A background instance has no terminal for a panic message; this puts it in the log.
+pub(crate) fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(outcome = %Outcome::InternalError, error = %info, "SplitHello panicked");
+        previous(info);
+    }));
 }
 
 /// RFC 3339 local time with milliseconds and offset, e.g. `2026-10-15T12:01:03.042+07:00`.
@@ -83,6 +156,10 @@ impl FormatTime for LocalTime {
 
 fn local_clock() -> String {
     jiff::Zoned::now().strftime("%H:%M:%S").to_string()
+}
+
+fn dated_clock() -> String {
+    jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Renders the events SplitHello emits as short aligned lines:
@@ -487,6 +564,45 @@ mod tests {
         assert_eq!(
             output,
             "12:00:00 · last 1m: 37 tunnels (12 split, 24 direct, 1 failed) · 6 active\n"
+        );
+    }
+
+    #[test]
+    fn options_turn_back_into_the_flags_that_made_them() {
+        use super::{LogFormat, LogOptions};
+        let options = |format, verbose, quiet| LogOptions {
+            format,
+            verbose,
+            quiet,
+        };
+        assert!(options(LogFormat::Auto, 0, false).flags().is_empty());
+        assert_eq!(options(LogFormat::Auto, 2, false).flags(), ["-vv"]);
+        assert_eq!(
+            options(LogFormat::Logfmt, 0, true).flags(),
+            ["-q", "--log-format", "logfmt"]
+        );
+    }
+
+    #[test]
+    fn a_log_file_keeps_one_previous_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("splithello.log");
+        let write = |text: &str| {
+            let (mut file, rotation) = super::open_log(&path).unwrap();
+            assert!(rotation.is_none());
+            io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        };
+        write("first\n");
+        write("second\n");
+        write("third\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third\n");
+        assert_eq!(
+            std::fs::read_to_string(super::rotated(&path)).unwrap(),
+            "second\n"
+        );
+        assert_eq!(
+            super::rotated(std::path::Path::new("/var/log/splithello")),
+            std::path::PathBuf::from("/var/log/splithello.1")
         );
     }
 

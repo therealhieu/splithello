@@ -48,6 +48,7 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 | [`src/app.rs`](../../src/app.rs) | Atomic listener binding, shared composition, readiness, signals, cancellation, and bounded shutdown |
 | [`src/lifecycle.rs`](../../src/lifecycle.rs) | `start`, `status`, `stop`: instance lock → runtime → control channel → `run.toml` → ready; exit codes 0/1/3 |
 | [`src/instance.rs`](../../src/instance.rs) | State dir (`$XDG_STATE_HOME/splithello`): exclusive `File::try_lock` on `splithello.lock` for the process lifetime, owner-only `run.toml`, liveness probe |
+| [`src/daemon.rs`](../../src/daemon.rs) | `start -d` (re-runs the binary as `start --log-file … --detached-child`: `setsid` on Unix, `DETACHED_PROCESS` on Windows; waits ≤ 15 s for `run.toml` naming the child) and `logs [-f] [-n N]` |
 | [`src/control.rs`](../../src/control.rs) | Loopback control channel (`STATUS`/`STOP <token>`), bounded and token-authenticated; how `stop` drains on every OS |
 | [`src/diagnostics.rs`](../../src/diagnostics.rs) | Stable outcome vocabulary and secret-safe tunnel reports |
 | [`config.example.toml`](../../config.example.toml) | Valid fixed-loopback Reddit/Medium example; also the `init` template |
@@ -140,7 +141,7 @@ The DoH endpoint must be bootstrap-reachable without resolving a configured sele
 
 - Follow [Rust language rules](languages/rust.md) and default rustfmt.
 - Keep the product as one edition-2024 binary with crate-private cohesive modules.
-- Use safe Rust; no `unsafe` is present in the verified implementation.
+- Use safe Rust. The one `unsafe` call clears the inherit flag on the std handles before `start -d` spawns on Windows (`src/daemon.rs`); std has no stable safe API for it.
 - Validate TOML, hostnames, CONNECT requests, DNS messages, and TLS bytes at their boundaries.
 - Keep listeners loopback-only and all sizes, timeouts, cache entries, ports, connections, and tasks bounded.
 - Do not log traffic payloads or secrets.
