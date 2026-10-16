@@ -1142,7 +1142,7 @@ shutdown_timeout = "1m"
         let readme = fs::read_to_string(root.join("README.md")).expect("read repository README");
         for required in [
             "cargo build --release",
-            "./target/release/splithello start",
+            "splithello start",
             "--config <PATH>",
             "127.0.0.1:8080",
             "http://127.0.0.1:8081/proxy.pac",
@@ -1165,8 +1165,8 @@ shutdown_timeout = "1m"
             "dns.ca_certificate",
             "may add trusted CA roots but never disables verification",
             "Successful startup does not prove bypass success",
-            "Stop the process",
-            "remove the HTTPS proxy or PAC setting",
+            "press `Ctrl-C`",
+            "remove the browser's proxy or PAC setting",
         ] {
             assert!(readme.contains(required), "README is missing `{required}`");
         }
