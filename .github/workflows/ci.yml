@@ -13,7 +13,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Markdown-only changes skip the expensive jobs. `check` and `bench-gate` are required status
+  # checks, so they are skipped with `if:` (reported as passing) rather than `paths-ignore`
+  # (never reported, which blocks the merge). README.md still runs `check`: a test reads it.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      check: ${{ steps.diff.outputs.check }}
+      bench: ${{ steps.diff.outputs.bench }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # A pull request checks out its merge commit, whose first parent is the base branch.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            files="$(git diff --name-only HEAD^1 HEAD)"
+          elif [[ -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]] && files="$(git diff --name-only "$BEFORE" HEAD)"; then
+            :
+          else
+            files="unknown"
+          fi
+          printf '%s\n' "$files"
+          code="$(grep -v '\.md$' <<<"$files" || true)"
+          readme="$(grep -x 'README.md' <<<"$files" || true)"
+          echo "check=$([[ -n "$code$readme" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "bench=$([[ -n "$code" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  # Fail open: if `changes` breaks, its outputs are empty and everything runs.
   check:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.check != 'false' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +63,10 @@ jobs:
   # same runner, so runner-to-runner speed differences cancel out (see benches/BASELINE.md).
   # macOS because the harness paces tunnels for macOS loopback TIME_WAIT (2×MSL = 30 s).
   bench-gate:
-    if: github.event_name == 'pull_request'
-    needs: check
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request'
+      && needs.check.result == 'success' && needs.changes.outputs.bench != 'false' }}
+    needs: [changes, check]
     runs-on: macos-15
     timeout-minutes: 120
     steps:
