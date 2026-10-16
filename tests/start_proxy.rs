@@ -1,10 +1,7 @@
-// Graceful shutdown needs a signal until `splithello stop` exists; Windows has none to send.
-#![cfg(unix)]
-
 mod support;
 
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hickory_proto::rr::RecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -312,7 +309,7 @@ async fn v17_signal_shutdown_closes_active_tunnel_and_listeners_before_deadline(
     )
     .await;
 
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     process.signal("TERM");
     let status = process.wait_for_exit(Duration::from_secs(3));
     assert!(status.success());
@@ -324,7 +321,8 @@ async fn v17_signal_shutdown_closes_active_tunnel_and_listeners_before_deadline(
         .await
         .expect("active tunnel closes during shutdown")
         .expect("read active tunnel closure");
-    assert!(!process.directory_path().join("state").exists());
+    // Shutdown leaves only the empty lock file behind.
+    assert!(!process.state_dir().join("run.toml").exists());
 }
 
 #[tokio::test]

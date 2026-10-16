@@ -1167,6 +1167,9 @@ shutdown_timeout = "1m"
             "Successful startup does not prove bypass success",
             "press `Ctrl-C`",
             "remove the browser's proxy or PAC setting",
+            "splithello status",
+            "splithello stop",
+            "SplitHello is already running (pid",
         ] {
             assert!(readme.contains(required), "README is missing `{required}`");
         }

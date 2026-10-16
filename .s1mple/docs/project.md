@@ -46,6 +46,9 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 | [`src/proxy.rs`](../../src/proxy.rs) | CONNECT parsing, upstream connection, direct/selected relay, listener and tunnel task ownership |
 | [`src/pac.rs`](../../src/pac.rs) | Deterministic target-only PAC rendering and bounded PAC service |
 | [`src/app.rs`](../../src/app.rs) | Atomic listener binding, shared composition, readiness, signals, cancellation, and bounded shutdown |
+| [`src/lifecycle.rs`](../../src/lifecycle.rs) | `start`, `status`, `stop`: instance lock → runtime → control channel → `run.toml` → ready; exit codes 0/1/3 |
+| [`src/instance.rs`](../../src/instance.rs) | State dir (`$XDG_STATE_HOME/splithello`): exclusive `File::try_lock` on `splithello.lock` for the process lifetime, owner-only `run.toml`, liveness probe |
+| [`src/control.rs`](../../src/control.rs) | Loopback control channel (`STATUS`/`STOP <token>`), bounded and token-authenticated; how `stop` drains on every OS |
 | [`src/diagnostics.rs`](../../src/diagnostics.rs) | Stable outcome vocabulary and secret-safe tunnel reports |
 | [`config.example.toml`](../../config.example.toml) | Valid fixed-loopback Reddit/Medium example; also the `init` template |
 | [`benches/proxy.rs`](../../benches/proxy.rs) | End-to-end benchmarks; paired base-vs-HEAD gate via [`scripts/bench.sh`](../../scripts/bench.sh) ([results](../../benches/BASELINE.md)) |
@@ -58,14 +61,16 @@ Reqwest default features are disabled. The active client uses rustls, disables a
 ### Startup and Shutdown
 
 ```text
-CLI parse → resolve --config or default path → Config::load and validate
+CLI parse → resolve --config or default path → lock the instance (or exit: already running)
+          → Config::load and validate
           → construct matcher/resolvers/semaphore
           → atomically bind proxy and optional PAC listeners
-          → spawn tracked services → emit outcome=ready
-          → signal/cancellation → stop accepts → drain to deadline → abort and join remainder
+          → spawn tracked services → bind control channel → write run.toml → emit outcome=ready
+          → signal / control STOP / cancellation → stop accepts → drain to deadline → abort and join remainder
+          → remove run.toml → release the lock
 ```
 
-Configuration is fully validated before runtime side effects. Required listeners bind before any service task starts or readiness is emitted. Every production task belongs to a runtime or service `JoinSet`; shutdown owns only process sockets, tasks, and memory.
+Configuration is fully validated before network side effects; only the state directory and its empty lock file exist earlier. Required listeners bind before any service task starts or readiness is emitted, and `run.toml` is written before readiness, so `status` and `stop` work for anyone who saw `outcome=ready`. Every production task belongs to a runtime or service `JoinSet`. Shutdown removes `run.toml` before releasing the lock; the empty lock file stays (deleting it would let two processes lock different files). `run_until_signal` checks cancellation first (`biased`), so a control `STOP` is a clean exit, and a failed Ctrl-C registration only warns.
 
 ### Direct Tunnel
 

@@ -227,6 +227,11 @@ impl CacheEntry {
     }
 }
 
+/// The newest release the last check saw, without asking GitHub again.
+pub(crate) fn cached_latest(path: &Path) -> Option<String> {
+    read_cache(path).map(|entry| entry.latest)
+}
+
 fn read_cache(path: &Path) -> Option<CacheEntry> {
     toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }

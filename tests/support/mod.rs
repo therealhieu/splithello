@@ -307,6 +307,7 @@ pub struct RunningSplitHello {
     pub pac_addr: Option<SocketAddr>,
     output: Arc<Mutex<String>>,
     directory: TempDir,
+    binary: PathBuf,
 }
 
 impl RunningSplitHello {
@@ -345,15 +346,11 @@ impl RunningSplitHello {
         let config_path = directory.path().join("config.toml");
         fs::write(&config_path, config_text).expect("write process configuration");
 
-        let mut child = Command::new(binary)
+        let mut child = isolated_command(binary, directory.path())
             .arg("start")
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", rust_log)
-            // Tests and benchmarks stay off GitHub and out of the real cache directory.
-            .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
-            .env("XDG_CACHE_HOME", directory.path())
-            .env("XDG_STATE_HOME", directory.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -384,7 +381,35 @@ impl RunningSplitHello {
             pac_addr,
             output,
             directory,
+            binary: binary.to_path_buf(),
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The same binary, with this instance's state and cache directories, so `status` and
+    /// `stop` find it.
+    pub fn command(&self) -> Command {
+        isolated_command(&self.binary, self.directory.path())
+    }
+
+    /// Runs another SplitHello command against this instance and waits for it.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.command()
+            .args(args)
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("run splithello command")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.directory.path().join("config.toml")
+    }
+
+    pub fn state_dir(&self) -> PathBuf {
+        self.directory.path().join("splithello")
     }
 
     pub fn output(&self) -> String {
@@ -399,10 +424,23 @@ impl RunningSplitHello {
         wait_for_captured_output(&self.output, needle)
     }
 
-    /// Asks the process to shut down gracefully, as Ctrl-C would.
+    /// Asks the process to shut down gracefully, as Ctrl-C would. Returns at once; follow
+    /// with [`Self::wait_for_exit`].
     #[cfg(unix)]
     pub fn interrupt(&mut self) {
         self.signal("INT");
+    }
+
+    /// Windows has no signal to send a console-less child, so this is `splithello stop`,
+    /// started without waiting, like a signal.
+    #[cfg(not(unix))]
+    pub fn interrupt(&mut self) {
+        self.command()
+            .arg("stop")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start splithello stop");
     }
 
     #[cfg(unix)]
@@ -463,6 +501,18 @@ impl TestConfig<'_> {
             self.shutdown_seconds,
         )
     }
+}
+
+/// `binary` with its state and cache in `directory`: off GitHub, out of the real cache, and
+/// never seeing a SplitHello another test (or the developer) runs.
+pub fn isolated_command(binary: &Path, directory: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
+        .env("XDG_CACHE_HOME", directory)
+        .env("XDG_STATE_HOME", directory)
+        .env_remove("RUST_LOG");
+    command
 }
 
 /// `path` as a quoted TOML string; Windows backslashes would otherwise be read as escapes.
