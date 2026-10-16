@@ -104,7 +104,7 @@ The transformed records preserve the exact ClientHello handshake byte sequence. 
 | `TargetResolver` | Selected hosts return validated IPv4 A candidates from authenticated DoH only |
 | `SystemResolver` | Unselected hosts retain normal ordered IPv4/IPv6 operating-system candidates |
 | `RewriteOutcome` | Explicit rewritten, safe pass-through, need-more, or rejected state; no partial transformed output |
-| `Outcome` / `TunnelReport` | Stable categories and bounded metadata; no raw headers, DNS messages, ClientHello bytes, credentials, cookies, or application payloads. Levels: split INFO, direct/cancelled DEBUG, failures WARN with a `hint`; a per-minute summary at INFO |
+| `Outcome` / `TunnelReport` | Stable categories and bounded metadata; no raw headers, DNS messages, ClientHello bytes, credentials, cookies, or application payloads. Levels: split and target idle/reset INFO, direct/idle/reset/cancelled DEBUG, failures WARN with a `hint` and the error chain; a per-minute summary at INFO |
 | PAC | Exact configured hosts and enabled subdomains use `PROXY`; all others use `DIRECT` |
 
 The scoped loopback port-0 mode exists for deterministic integration tests. It allows explicit nonstandard ports to be listed for test origins, but CONNECT parsing still requires exact membership in `proxy.ports`. Normal nonzero listener configurations remain limited to ports 443 and 8443.

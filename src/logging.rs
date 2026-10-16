@@ -234,7 +234,9 @@ impl HumanFormat {
     fn outcome_line(&self, outcome: Outcome, fields: &Fields) -> String {
         let (icon, paint) = match outcome {
             Outcome::TargetTransformed => ("✓", Paint::Green),
-            Outcome::DirectRelay | Outcome::Cancelled => ("·", Paint::Dim),
+            Outcome::DirectRelay | Outcome::Idle | Outcome::Reset | Outcome::Cancelled => {
+                ("·", Paint::Dim)
+            }
             Outcome::Timeout => ("✗", Paint::Yellow),
             _ => ("✗", Paint::Red),
         };
