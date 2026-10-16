@@ -222,26 +222,32 @@ mod tests {
 
     #[test]
     fn default_path_follows_xdg_then_home() {
-        let os = |value: &str| Some(OsString::from(value));
+        // Absolute on every OS; a literal "/xdg" is not absolute on Windows.
+        let root = std::env::temp_dir();
+        let (xdg, home) = (root.join("xdg"), root.join("home"));
+        let os = |path: &PathBuf| Some(path.clone().into_os_string());
         let config = |xdg, home| xdg_path(xdg, home, ".config", "config.toml");
         assert_eq!(
-            config(os("/xdg"), os("/home/me")),
-            Some(PathBuf::from("/xdg/splithello/config.toml"))
+            config(os(&xdg), os(&home)),
+            Some(xdg.join("splithello").join("config.toml"))
         );
         assert_eq!(
-            config(os("relative"), os("/home/me")),
-            Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
+            config(Some(OsString::from("relative")), os(&home)),
+            Some(home.join(".config").join("splithello").join("config.toml"))
         );
         assert_eq!(
-            config(None, os("/home/me")),
-            Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
+            config(None, os(&home)),
+            Some(home.join(".config").join("splithello").join("config.toml"))
         );
+        assert_eq!(config(None, Some(OsString::from("relative"))), None);
         assert_eq!(config(None, None), None);
         assert_eq!(
-            xdg_path(None, os("/home/me"), ".cache", "update-check.toml"),
-            Some(PathBuf::from(
-                "/home/me/.cache/splithello/update-check.toml"
-            ))
+            xdg_path(None, os(&home), ".cache", "update-check.toml"),
+            Some(
+                home.join(".cache")
+                    .join("splithello")
+                    .join("update-check.toml")
+            )
         );
     }
 }

@@ -1,3 +1,6 @@
+// Graceful shutdown needs a signal until `splithello stop` exists; Windows has none to send.
+#![cfg(unix)]
+
 mod support;
 
 use std::net::Ipv4Addr;
@@ -37,7 +40,7 @@ async fn kernel_assigned_proxy_pac_and_origin_ports_are_distinct_and_held() {
         assert!(std::net::TcpListener::bind(process.proxy_addr).is_err());
         assert!(std::net::TcpListener::bind(pac).is_err());
         assert!(std::net::TcpListener::bind(origin.addr).is_err());
-        process.signal("INT");
+        process.interrupt();
         assert!(process.wait_for_exit(TEST_TIMEOUT).success());
     }
 }
@@ -59,7 +62,7 @@ async fn startup_prewarms_each_target_over_doh_before_any_request() {
     doh.wait_for_queries(1).await;
     assert_eq!(doh.queried_names(), vec!["selected.test".to_owned()]);
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
@@ -92,7 +95,7 @@ async fn ephemeral_listener_runtime_enforces_exact_dynamic_allowed_port() {
     );
     assert_only_prewarm_queries(&doh, "selected.test");
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
@@ -157,11 +160,11 @@ async fn v14_direct_ipv4_and_available_ipv6_relay_are_byte_identical() {
             vec![b"direct-ipv6".to_vec()]
         );
         assert_only_prewarm_queries(&doh, "selected.test");
-        ipv6_process.signal("INT");
+        ipv6_process.interrupt();
         assert!(ipv6_process.wait_for_exit(TEST_TIMEOUT).success());
     }
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
@@ -209,7 +212,7 @@ async fn v15_selected_target_uses_authenticated_doh_and_preserves_client_hello()
     assert_eq!(&received[0][consumed..], b"opaque-tail");
     process.wait_for_output("outcome=target-transformed");
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
@@ -285,10 +288,11 @@ async fn v16_malformed_selected_tunnel_isolated_from_direct_success_and_bound() 
     assert_eq!(reply, b"direct-success");
     assert!(origin.peak_active() <= 1);
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn v17_signal_shutdown_closes_active_tunnel_and_listeners_before_deadline() {
     let doh = TestDoh::start(DohResponse::Addresses(vec![Ipv4Addr::LOCALHOST])).await;
@@ -355,7 +359,7 @@ async fn v18_exact_start_command_reaches_ready_and_serves_target_only_pac() {
     assert!(text.contains(&format!("PROXY {}", process.proxy_addr)));
     assert!(text.contains("return \"DIRECT\""));
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 
@@ -409,7 +413,7 @@ async fn v19_doh_failure_emits_stable_secret_safe_diagnostic() {
             == 0
     );
 
-    process.signal("INT");
+    process.interrupt();
     assert!(process.wait_for_exit(TEST_TIMEOUT).success());
 }
 

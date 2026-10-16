@@ -11,6 +11,7 @@ fn splithello(args: &[&str], xdg_config_home: &std::path::Path) -> Output {
         .args(args)
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_CACHE_HOME", xdg_config_home)
+        .env("XDG_STATE_HOME", xdg_config_home)
         .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
         .env("RUST_LOG", "info")
         .output()
@@ -48,7 +49,7 @@ fn assert_creates_starter_and_stops(output: &Output, path: &std::path::Path) {
 fn start_creates_the_default_config_and_stops_without_targets() {
     let home = tempfile::tempdir().unwrap();
     let output = splithello(&["start"], home.path());
-    assert_creates_starter_and_stops(&output, &home.path().join("splithello/config.toml"));
+    assert_creates_starter_and_stops(&output, &home.path().join("splithello").join("config.toml"));
 }
 
 #[test]
@@ -60,13 +61,13 @@ fn start_creates_an_explicit_config_path_and_stops_without_targets() {
         home.path(),
     );
     assert_creates_starter_and_stops(&output, &path);
-    assert!(!home.path().join("splithello/config.toml").exists());
+    assert!(!home.path().join("splithello").join("config.toml").exists());
 }
 
 #[test]
 fn an_existing_config_is_never_overwritten() {
     let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("splithello/config.toml");
+    let path = home.path().join("splithello").join("config.toml");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, "targets = []\n# edited\n").unwrap();
 
@@ -89,7 +90,7 @@ fn init_is_no_longer_a_command() {
     let home = tempfile::tempdir().unwrap();
     let output = splithello(&["init"], home.path());
     assert!(!output.status.success());
-    assert!(!home.path().join("splithello/config.toml").exists());
+    assert!(!home.path().join("splithello").join("config.toml").exists());
 }
 
 async fn check_against(response: DohResponse) -> (Output, tempfile::TempDir) {

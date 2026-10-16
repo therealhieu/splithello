@@ -42,7 +42,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use support::{DohOptions, DohResponse, RunningSplitHello, TestDoh, tls_material};
+use support::{DohOptions, DohResponse, RunningSplitHello, TestDoh, tls_material, toml_path};
 
 /// Simulated client ↔ DoH round trip; roughly a nearby public resolver.
 const DOH_RTT: Duration = Duration::from_millis(20);
@@ -329,13 +329,13 @@ impl Lab {
     /// with the proxy on a kernel-assigned loopback port and PAC disabled.
     fn config(&self, schema: ConfigSchema) -> String {
         let (tls, stream) = (self.tls_origin.addr.port(), self.stream_origin.addr.port());
-        let (upstream, ca) = (self.doh.url(), self.doh.ca_pem.display());
+        let (upstream, ca) = (self.doh.url(), toml_path(&self.doh.ca_pem));
         match schema {
             ConfigSchema::V1 => format!(
-                "[proxy]\nlisten = \"127.0.0.1:0\"\nallowed_ports = [{tls}, {stream}]\n\n[dns]\nupstream = \"{upstream}\"\nca_certificate = \"{ca}\"\n\n[[targets]]\nhost = \"{TARGET_DOMAIN}\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n"
+                "[proxy]\nlisten = \"127.0.0.1:0\"\nallowed_ports = [{tls}, {stream}]\n\n[dns]\nupstream = \"{upstream}\"\nca_certificate = {ca}\n\n[[targets]]\nhost = \"{TARGET_DOMAIN}\"\ninclude_subdomains = true\nstrategy = \"tls-record-split\"\n"
             ),
             ConfigSchema::V2 => format!(
-                "targets = [\"{TARGET_DOMAIN}\"]\n\n[proxy]\nlisten = \"127.0.0.1:0\"\npac = false\nports = [{tls}, {stream}]\n\n[dns]\nupstream = \"{upstream}\"\nca_certificate = \"{ca}\"\n"
+                "targets = [\"{TARGET_DOMAIN}\"]\n\n[proxy]\nlisten = \"127.0.0.1:0\"\npac = false\nports = [{tls}, {stream}]\n\n[dns]\nupstream = \"{upstream}\"\nca_certificate = {ca}\n"
             ),
         }
     }

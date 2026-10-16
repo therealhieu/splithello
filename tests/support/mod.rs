@@ -353,6 +353,7 @@ impl RunningSplitHello {
             // Tests and benchmarks stay off GitHub and out of the real cache directory.
             .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
             .env("XDG_CACHE_HOME", directory.path())
+            .env("XDG_STATE_HOME", directory.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -396,6 +397,12 @@ impl RunningSplitHello {
 
     pub fn wait_for_output(&self, needle: &str) -> String {
         wait_for_captured_output(&self.output, needle)
+    }
+
+    /// Asks the process to shut down gracefully, as Ctrl-C would.
+    #[cfg(unix)]
+    pub fn interrupt(&mut self) {
+        self.signal("INT");
     }
 
     #[cfg(unix)]
@@ -447,15 +454,20 @@ impl TestConfig<'_> {
             .map(|secret| format!("# {secret}\n"))
             .unwrap_or_default();
         format!(
-            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
+            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = {}\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
             self.target_host,
             self.origin_port,
             self.doh.url(),
-            self.doh.ca_pem.display(),
+            toml_path(&self.doh.ca_pem),
             self.max_connections,
             self.shutdown_seconds,
         )
     }
+}
+
+/// `path` as a quoted TOML string; Windows backslashes would otherwise be read as escapes.
+pub fn toml_path(path: &Path) -> String {
+    toml::Value::String(path.display().to_string()).to_string()
 }
 
 pub async fn connect_via_proxy(proxy: SocketAddr, authority: &str) -> TcpStream {
