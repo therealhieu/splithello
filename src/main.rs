@@ -9,6 +9,7 @@ mod pac;
 mod proxy;
 mod setup;
 mod tls;
+mod update;
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ async fn main() {
             tracing::error!(
                 outcome = %error.outcome(),
                 error = %error,
-                hint = error.outcome().hint(),
+                hint = error.hint(),
                 "SplitHello stopped"
             );
             std::process::exit(1);
@@ -44,8 +45,12 @@ async fn run(cli: Cli) -> Result<bool, AppError> {
             let Some(config) = load_config(&config_path(&args)?)? else {
                 return Ok(false);
             };
+            let check_updates = update::check_enabled(config.update().check());
             let mut runtime = Runtime::start(config).await?;
             runtime.ready().emit();
+            if check_updates {
+                runtime.spawn_update_notifier();
+            }
             let run_result = runtime.run_until_signal().await;
             let shutdown_result = runtime.shutdown().await;
             run_result.and(shutdown_result).map(|()| true)
@@ -57,6 +62,7 @@ async fn run(cli: Cli) -> Result<bool, AppError> {
             };
             setup::check(&path, &config).await
         }
+        Command::Update(args) => update::run_command(&args).await,
     }
 }
 

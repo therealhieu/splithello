@@ -8,12 +8,14 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::default_cache_path;
 use crate::config::{Config, ConfigError};
 use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
 use crate::domain::{DomainError, DomainName};
 use crate::pac::{PacServer, PacServiceError, render_pac};
 use crate::proxy::{ProxyLimits, ProxyServer, ProxyServiceError, ProxyState};
+use crate::update::{self, ReleaseSource, UpdateError};
 
 const SUMMARY_WINDOW: Duration = Duration::from_secs(60);
 
@@ -107,6 +109,10 @@ pub(crate) enum AppError {
     Task(#[source] JoinError),
     #[error("could not install or receive shutdown signal")]
     Signal(#[source] std::io::Error),
+    #[error("update failed: {0}")]
+    Update(#[from] UpdateError),
+    #[error("could not ask for confirmation")]
+    Prompt(#[source] std::io::Error),
 }
 
 impl AppError {
@@ -122,7 +128,19 @@ impl AppError {
             | Self::ProxyService(_)
             | Self::PacService(_) => Outcome::ConnectError,
             Self::ServiceStopped | Self::Task(_) => Outcome::InternalError,
-            Self::Signal(_) => Outcome::InternalError,
+            Self::Signal(_) | Self::Prompt(_) => Outcome::InternalError,
+            Self::Update(_) => Outcome::ConnectError,
+        }
+    }
+
+    /// What the user can do about it; the outcome's hint unless the error knows better.
+    pub(crate) const fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Update(_) => Some(
+                "check the connection, or download the release from \
+                 https://github.com/therealhieu/splithello/releases",
+            ),
+            _ => self.outcome().hint(),
         }
     }
 }
@@ -132,6 +150,7 @@ pub(crate) struct Runtime {
     tasks: JoinSet<Result<(), AppError>>,
     shutdown_timeout: Duration,
     ready: ReadyMetadata,
+    resolver: Arc<DohResolver>,
 }
 
 impl Runtime {
@@ -219,7 +238,7 @@ impl Runtime {
         tasks.spawn(report_summaries(stats, cancel.child_token()));
         // Detached: it finishes on its own, which `tasks` would read as a stopped service.
         tokio::spawn(prewarm_targets(
-            target_resolver,
+            target_resolver.clone(),
             config
                 .targets()
                 .iter()
@@ -233,11 +252,27 @@ impl Runtime {
             tasks,
             shutdown_timeout,
             ready,
+            resolver: target_resolver,
         })
     }
 
     pub(crate) fn ready(&self) -> &ReadyMetadata {
         &self.ready
+    }
+
+    /// Starts the daily check for a newer release. Detached like the prewarm: it never
+    /// stops the proxy, and a failure only logs at DEBUG.
+    pub(crate) fn spawn_update_notifier(&self) {
+        match ReleaseSource::github(self.resolver.clone()) {
+            Ok(source) => {
+                tokio::spawn(update::notify(
+                    source,
+                    default_cache_path(update::CACHE_FILE),
+                    self.cancel.child_token(),
+                ));
+            }
+            Err(error) => tracing::debug!(error = %error, "update check unavailable"),
+        }
     }
 
     #[cfg(test)]

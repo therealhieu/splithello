@@ -10,6 +10,8 @@ fn splithello(args: &[&str], xdg_config_home: &std::path::Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_splithello"))
         .args(args)
         .env("XDG_CONFIG_HOME", xdg_config_home)
+        .env("XDG_CACHE_HOME", xdg_config_home)
+        .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
         .env("RUST_LOG", "info")
         .output()
         .expect("run splithello")
@@ -125,6 +127,13 @@ async fn check_resolves_every_target_and_exits_zero() {
         "{printed}"
     );
     assert!(printed.contains("pac      disabled"), "{printed}");
+    assert!(
+        printed.contains(&format!(
+            "version  {}  · update check off",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{printed}"
+    );
     assert!(
         printed.contains("ok: ready to `splithello start`"),
         "{printed}"

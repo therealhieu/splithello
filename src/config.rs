@@ -34,7 +34,20 @@ pub(crate) struct Config {
     proxy: ProxyConfig,
     dns: DnsConfig,
     limits: RuntimeLimits,
+    update: UpdateConfig,
     targets: Vec<TargetRule>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateConfig {
+    check: bool,
+}
+
+impl UpdateConfig {
+    /// Whether `start` and `check` look for a newer release.
+    pub(crate) fn check(&self) -> bool {
+        self.check
+    }
 }
 
 #[allow(dead_code)]
@@ -56,8 +69,31 @@ pub(crate) struct DnsConfig {
     max_response_bytes: usize,
 }
 
+impl Default for DnsConfig {
+    /// The `[dns]` defaults, for commands that run without a usable configuration file.
+    fn default() -> Self {
+        Self::validate(RawDnsConfig::default(), Path::new("."))
+            .expect("default DNS settings are valid")
+    }
+}
+
 #[allow(dead_code)]
 impl DnsConfig {
+    fn validate(raw: RawDnsConfig, base_dir: &Path) -> Result<Self, ConfigError> {
+        Ok(Self {
+            upstream: validate_doh_url(&raw.upstream)?,
+            ca_certificate_pem: load_ca_certificate(raw.ca_certificate, base_dir)?,
+            timeout: bounded_duration("dns.timeout", raw.timeout, MAX_TIMEOUT)?,
+            cache_max_ttl: bounded_duration("dns.cache_ttl", raw.cache_ttl, MAX_CACHE_TTL)?,
+            cache_capacity: bounded_usize("dns.cache_size", raw.cache_size, MAX_DNS_CACHE_SIZE)?,
+            max_response_bytes: bounded_usize(
+                "dns.max_response_bytes",
+                raw.max_response_bytes,
+                MAX_DNS_RESPONSE_BYTES,
+            )?,
+        })
+    }
+
     pub(crate) fn upstream(&self) -> &reqwest::Url {
         &self.upstream
     }
@@ -171,6 +207,20 @@ struct RawConfig {
     dns: RawDnsConfig,
     #[serde(default)]
     limits: RawRuntimeLimits,
+    #[serde(default)]
+    update: RawUpdateConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawUpdateConfig {
+    check: bool,
+}
+
+impl Default for RawUpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,25 +356,7 @@ impl Config {
         }
 
         let allowed_ports = validate_allowed_ports(raw.proxy.ports, listen.port() == 0)?;
-        let upstream = validate_doh_url(&raw.dns.upstream)?;
-        let ca_certificate_pem = load_ca_certificate(raw.dns.ca_certificate, base_dir)?;
-
-        let dns = DnsConfig {
-            upstream,
-            ca_certificate_pem,
-            timeout: bounded_duration("dns.timeout", raw.dns.timeout, MAX_TIMEOUT)?,
-            cache_max_ttl: bounded_duration("dns.cache_ttl", raw.dns.cache_ttl, MAX_CACHE_TTL)?,
-            cache_capacity: bounded_usize(
-                "dns.cache_size",
-                raw.dns.cache_size,
-                MAX_DNS_CACHE_SIZE,
-            )?,
-            max_response_bytes: bounded_usize(
-                "dns.max_response_bytes",
-                raw.dns.max_response_bytes,
-                MAX_DNS_RESPONSE_BYTES,
-            )?,
-        };
+        let dns = DnsConfig::validate(raw.dns, base_dir)?;
 
         let limits = RuntimeLimits {
             max_connect_header_bytes: bounded_usize(
@@ -374,6 +406,9 @@ impl Config {
             },
             dns,
             limits,
+            update: UpdateConfig {
+                check: raw.update.check,
+            },
             targets,
         })
     }
@@ -388,6 +423,10 @@ impl Config {
 
     pub(crate) fn limits(&self) -> &RuntimeLimits {
         &self.limits
+    }
+
+    pub(crate) fn update(&self) -> &UpdateConfig {
+        &self.update
     }
 
     pub(crate) fn targets(&self) -> &[TargetRule] {
@@ -645,7 +684,7 @@ mod tests {
 
     use crate::domain::DomainError;
 
-    use super::{Config, ConfigError, Strategy};
+    use super::{Config, ConfigError, DnsConfig, Strategy};
 
     #[derive(Debug)]
     enum ExpectedConfigError {
@@ -776,10 +815,30 @@ upstream = "https://1.1.1.1/dns-query"
         assert_eq!(config.limits.client_hello_timeout, Duration::from_secs(5));
         assert_eq!(config.limits.idle_timeout, Duration::from_secs(300));
         assert_eq!(config.limits.shutdown_timeout, Duration::from_secs(10));
+        assert!(config.update.check);
         assert_eq!(config.targets.len(), 1);
         assert_eq!(config.targets[0].host().as_str(), "reddit.com");
         assert!(config.targets[0].includes_subdomains());
         assert_eq!(config.targets[0].strategy(), Strategy::TlsRecordSplit);
+    }
+
+    #[test]
+    fn update_check_can_be_turned_off() {
+        let config = parse("targets = [\"reddit.com\"]\n\n[update]\ncheck = false\n")
+            .expect("update section");
+        assert!(!config.update().check());
+    }
+
+    #[test]
+    fn default_dns_config_matches_parsed_defaults() {
+        let parsed = parse("targets = [\"reddit.com\"]\n").unwrap();
+        let default = DnsConfig::default();
+        assert_eq!(default.upstream, parsed.dns.upstream);
+        assert!(default.ca_certificate_pem.is_none());
+        assert_eq!(default.timeout, parsed.dns.timeout);
+        assert_eq!(default.cache_max_ttl, parsed.dns.cache_max_ttl);
+        assert_eq!(default.cache_capacity, parsed.dns.cache_capacity);
+        assert_eq!(default.max_response_bytes, parsed.dns.max_response_bytes);
     }
 
     #[test]
@@ -862,6 +921,11 @@ shutdown_timeout = "1m"
                 "unknown nested field",
                 VALID.replace("[dns]", "[dns]\nunknown = true"),
                 ExpectedConfigError::Toml("unknown field `unknown`"),
+            ),
+            (
+                "unknown update field",
+                format!("{VALID}\n[update]\nchecks = false\n"),
+                ExpectedConfigError::Toml("unknown field `checks`"),
             ),
             (
                 "missing targets",
@@ -1063,6 +1127,11 @@ shutdown_timeout = "1m"
             defaults.limits.max_connections
         );
         assert_eq!(config.limits.idle_timeout, defaults.limits.idle_timeout);
+        assert_eq!(config.update.check, defaults.update.check);
+        assert!(
+            starter.contains("# check = true"),
+            "example is missing the commented `[update]` default"
+        );
         assert_eq!(config.targets.len(), 2);
         for (rule, host) in config.targets.iter().zip(["reddit.com", "medium.com"]) {
             assert_eq!(rule.host().as_str(), host);

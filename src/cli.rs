@@ -47,6 +47,38 @@ pub(crate) enum Command {
     Start(ConfigArgs),
     /// Validate the configuration, check listeners, and resolve every target over DoH.
     Check(ConfigArgs),
+    /// Replace this binary with the newest release; Homebrew and Cargo installs print their
+    /// upgrade command instead.
+    Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct UpdateArgs {
+    /// Its [dns] settings resolve GitHub; defaults apply when the file is missing or invalid.
+    #[command(flatten)]
+    pub(crate) config: ConfigArgs,
+    /// Only report whether a newer release exists.
+    #[arg(long, conflicts_with_all = ["yes", "version"])]
+    pub(crate) check: bool,
+    /// Install without asking.
+    #[arg(short, long)]
+    pub(crate) yes: bool,
+    /// Install this release instead of the newest, e.g. v0.2.0; it may be older or a prerelease.
+    #[arg(long, value_name = "TAG")]
+    pub(crate) version: Option<String>,
+}
+
+impl UpdateArgs {
+    /// The `--version` release tag, with the `v` prefix releases are tagged with.
+    pub(crate) fn tag(&self) -> Option<String> {
+        self.version.as_deref().map(|version| {
+            if version.starts_with('v') {
+                version.to_owned()
+            } else {
+                format!("v{version}")
+            }
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -64,24 +96,47 @@ impl ConfigArgs {
     }
 }
 
+/// `$XDG_CONFIG_HOME/splithello/config.toml`, else `~/.config/splithello/config.toml`.
 pub(crate) fn default_config_path() -> Option<PathBuf> {
-    config_path_from(
+    xdg_path(
         std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
+        home_dir(),
+        ".config",
+        "config.toml",
     )
 }
 
-/// XDG base-directory rule: a relative or empty `XDG_CONFIG_HOME` is ignored.
-fn config_path_from(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    xdg_config_home
+/// `$XDG_CACHE_HOME/splithello/<file>`, else `~/.cache/splithello/<file>`.
+pub(crate) fn default_cache_path(file: &str) -> Option<PathBuf> {
+    xdg_path(
+        std::env::var_os("XDG_CACHE_HOME"),
+        home_dir(),
+        ".cache",
+        file,
+    )
+}
+
+/// `HOME` on Unix, `USERPROFILE` on Windows.
+fn home_dir() -> Option<OsString> {
+    std::env::home_dir().map(PathBuf::into_os_string)
+}
+
+/// XDG base-directory rule: a relative or empty `$XDG_*_HOME` is ignored.
+fn xdg_path(
+    xdg_home: Option<OsString>,
+    home: Option<OsString>,
+    home_fallback: &str,
+    file: &str,
+) -> Option<PathBuf> {
+    xdg_home
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
             home.map(PathBuf::from)
                 .filter(|path| path.is_absolute())
-                .map(|home| home.join(".config"))
+                .map(|home| home.join(home_fallback))
         })
-        .map(|base| base.join("splithello").join("config.toml"))
+        .map(|base| base.join("splithello").join(file))
 }
 
 #[cfg(test)]
@@ -89,9 +144,9 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, config_path_from};
+    use super::{Cli, Command, xdg_path};
     use crate::logging::LogFormat;
 
     #[test]
@@ -127,6 +182,30 @@ mod tests {
     }
 
     #[test]
+    fn update_takes_check_yes_and_a_release_tag() {
+        Cli::command().debug_assert();
+
+        let cli = Cli::try_parse_from(["splithello", "update", "--version", "0.2.0", "-y"])
+            .expect("valid CLI");
+        let Command::Update(args) = cli.command else {
+            panic!("expected update");
+        };
+        assert!(args.yes);
+        assert_eq!(args.tag().as_deref(), Some("v0.2.0"));
+
+        let cli = Cli::try_parse_from(["splithello", "update", "--version", "v0.1.0-rc.3"])
+            .expect("valid CLI");
+        let Command::Update(args) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(args.tag().as_deref(), Some("v0.1.0-rc.3"));
+
+        let error = Cli::try_parse_from(["splithello", "update", "--check", "--yes"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(Cli::try_parse_from(["splithello", "--version"]).is_err());
+    }
+
+    #[test]
     fn log_flags_are_global_and_exclusive() {
         let cli = Cli::try_parse_from(["splithello", "start", "-vv", "--log-format", "logfmt"])
             .expect("valid CLI");
@@ -144,18 +223,25 @@ mod tests {
     #[test]
     fn default_path_follows_xdg_then_home() {
         let os = |value: &str| Some(OsString::from(value));
+        let config = |xdg, home| xdg_path(xdg, home, ".config", "config.toml");
         assert_eq!(
-            config_path_from(os("/xdg"), os("/home/me")),
+            config(os("/xdg"), os("/home/me")),
             Some(PathBuf::from("/xdg/splithello/config.toml"))
         );
         assert_eq!(
-            config_path_from(os("relative"), os("/home/me")),
+            config(os("relative"), os("/home/me")),
             Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
         );
         assert_eq!(
-            config_path_from(None, os("/home/me")),
+            config(None, os("/home/me")),
             Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
         );
-        assert_eq!(config_path_from(None, None), None);
+        assert_eq!(config(None, None), None);
+        assert_eq!(
+            xdg_path(None, os("/home/me"), ".cache", "update-check.toml"),
+            Some(PathBuf::from(
+                "/home/me/.cache/splithello/update-check.toml"
+            ))
+        );
     }
 }

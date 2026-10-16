@@ -166,6 +166,9 @@ impl HumanFormat {
         if fields.get("tunnels").is_some() {
             return format!("{time} {}", self.summary(fields));
         }
+        if let Some(latest) = fields.get("latest_version") {
+            return format!("{time} {}", self.update_available(latest, fields));
+        }
         if let Some(outcome) = outcome {
             return format!("{time} {}", self.outcome_line(outcome, fields));
         }
@@ -258,6 +261,21 @@ impl HumanFormat {
         }
         if let Some(error) = fields.get("error") {
             let _ = write!(line, "  {error}");
+        }
+        if let Some(hint) = fields.get("hint") {
+            let _ = write!(line, "{}", self.paint(Paint::Dim, &format!(" → {hint}")));
+        }
+        line
+    }
+
+    fn update_available(&self, latest: &str, fields: &Fields) -> String {
+        let mut line = format!(
+            "{} {} {latest} available",
+            self.paint(Paint::Yellow, "↑"),
+            self.paint(Paint::Yellow, &format!("{:<8}", "update"))
+        );
+        if let Some(current) = fields.get("current_version") {
+            let _ = write!(line, " (you have {current})");
         }
         if let Some(hint) = fields.get("hint") {
             let _ = write!(line, "{}", self.paint(Paint::Dim, &format!(" → {hint}")));
@@ -432,6 +450,22 @@ mod tests {
             ),
             "{}",
             lines[1]
+        );
+    }
+
+    #[test]
+    fn update_event_renders_versions_and_the_upgrade_command() {
+        let output = capture(|| {
+            tracing::info!(
+                latest_version = "0.2.0",
+                current_version = "0.1.0",
+                hint = "brew upgrade splithello",
+                "update available"
+            );
+        });
+        assert_eq!(
+            output,
+            "12:00:00 ↑ update   0.2.0 available (you have 0.1.0) → brew upgrade splithello\n"
         );
     }
 

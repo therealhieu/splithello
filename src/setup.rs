@@ -4,11 +4,14 @@ use std::fs;
 use std::io::{ErrorKind, Write as _};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::app::AppError;
+use crate::cli::default_cache_path;
 use crate::config::Config;
 use crate::dns::{DohResolver, TargetResolver};
+use crate::update::{self, InstallMethod, ReleaseSource};
 
 /// The repository example doubles as the starter file, so the two cannot drift.
 const TEMPLATE: &str = include_str!("../config.example.toml");
@@ -69,7 +72,7 @@ pub(crate) async fn check(path: &Path, config: &Config) -> Result<bool, AppError
         humantime::format_duration(dns.cache_max_ttl()),
     );
 
-    let resolver = DohResolver::new(dns).map_err(AppError::Resolver)?;
+    let resolver = Arc::new(DohResolver::new(dns).map_err(AppError::Resolver)?);
     println!("targets  {}", config.targets().len());
     for rule in config.targets() {
         let scope = if rule.includes_subdomains() {
@@ -101,6 +104,12 @@ pub(crate) async fn check(path: &Path, config: &Config) -> Result<bool, AppError
             }
         }
     }
+    // Informational only: being offline or behind GitHub's rate limit is not a failure.
+    println!(
+        "version  {}  {}",
+        update::CURRENT_VERSION,
+        release_status(config, resolver).await
+    );
 
     if failures == 0 {
         println!("ok: ready to `splithello start`");
@@ -108,6 +117,26 @@ pub(crate) async fn check(path: &Path, config: &Config) -> Result<bool, AppError
         println!("{failures} check(s) failed");
     }
     Ok(failures == 0)
+}
+
+async fn release_status(config: &Config, resolver: Arc<DohResolver>) -> String {
+    if !update::check_enabled(config.update().check()) {
+        return "· update check off".to_owned();
+    }
+    let source = match ReleaseSource::github(resolver) {
+        Ok(source) => source,
+        Err(error) => return format!("· update check failed: {error}"),
+    };
+    let cache = default_cache_path(update::CACHE_FILE);
+    match update::latest_version_cached(&source, cache.as_deref()).await {
+        Ok(latest) if update::is_newer(&latest) => format!(
+            "↑ {latest} available → {}",
+            InstallMethod::current().upgrade_command()
+        ),
+        Ok(_) => "✓ latest".to_owned(),
+        Err(update::UpdateError::NoRelease) => "· no stable release yet".to_owned(),
+        Err(error) => format!("· update check failed: {error}"),
+    }
 }
 
 fn report_listener(label: &str, address: SocketAddr, display: Option<&str>) -> bool {

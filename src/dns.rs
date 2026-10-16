@@ -440,6 +440,31 @@ impl TargetResolver for DohResolver {
     }
 }
 
+/// Resolves a `reqwest::Client`'s hosts over the configured DoH upstream (IPv4 only), so
+/// SplitHello's own HTTPS requests make no plain-DNS lookups either.
+#[derive(Clone)]
+pub(crate) struct DohReqwestResolver(Arc<DohResolver>);
+
+impl DohReqwestResolver {
+    pub(crate) fn new(resolver: Arc<DohResolver>) -> Self {
+        Self(resolver)
+    }
+}
+
+impl reqwest::dns::Resolve for DohReqwestResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.0.clone();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let host = DomainName::parse(&host)?;
+            let addrs = resolver.resolve_ipv4(&host).await?;
+            let addrs: reqwest::dns::Addrs =
+                Box::new(addrs.into_iter().map(|ip| SocketAddr::from((ip, 0))));
+            Ok(addrs)
+        })
+    }
+}
+
 fn build_authenticated_client(
     additional_ca_pem: Option<&[u8]>,
     timeout: Duration,
