@@ -11,6 +11,7 @@ use crate::app::AppError;
 use crate::cli::default_cache_path;
 use crate::config::Config;
 use crate::dns::{DohResolver, TargetResolver};
+use crate::instance::{self, Liveness, RunRecord, StatePaths};
 use crate::update::{self, InstallMethod, ReleaseSource};
 
 /// The repository example doubles as the starter file, so the two cannot drift.
@@ -46,12 +47,26 @@ pub(crate) async fn check(path: &Path, config: &Config) -> Result<bool, AppError
     let mut failures = 0_usize;
     println!("config   {}", path.display());
 
+    // Names the owner of a busy port when it is SplitHello itself.
+    let running = StatePaths::from_env()
+        .ok()
+        .and_then(|paths| instance::probe(&paths).ok())
+        .and_then(|liveness| match liveness {
+            Liveness::Running(record) => Some(record),
+            Liveness::NotRunning { .. } | Liveness::Starting => None,
+        });
     let proxy = config.proxy();
-    failures += usize::from(!report_listener("proxy", proxy.listen(), None));
+    let owner = running
+        .as_ref()
+        .filter(|record| record.proxy == proxy.listen());
+    failures += usize::from(!report_listener("proxy", proxy.listen(), None, owner));
     match proxy.pac_listen() {
         Some(address) => {
             let url = format!("http://{address}/proxy.pac");
-            failures += usize::from(!report_listener("pac", address, Some(&url)));
+            let owner = running
+                .as_ref()
+                .filter(|record| record.pac.as_deref() == Some(url.as_str()));
+            failures += usize::from(!report_listener("pac", address, Some(&url), owner));
         }
         None => println!("pac      disabled"),
     }
@@ -139,7 +154,12 @@ async fn release_status(config: &Config, resolver: Arc<DohResolver>) -> String {
     }
 }
 
-fn report_listener(label: &str, address: SocketAddr, display: Option<&str>) -> bool {
+fn report_listener(
+    label: &str,
+    address: SocketAddr,
+    display: Option<&str>,
+    owner: Option<&RunRecord>,
+) -> bool {
     let shown = display.map_or_else(|| address.to_string(), str::to_owned);
     match std::net::TcpListener::bind(address) {
         Ok(_) => {
@@ -147,7 +167,13 @@ fn report_listener(label: &str, address: SocketAddr, display: Option<&str>) -> b
             true
         }
         Err(error) if error.kind() == ErrorKind::AddrInUse => {
-            println!("{label:<8} {shown}  ✗ in use (is SplitHello already running?)");
+            match owner {
+                Some(record) => println!(
+                    "{label:<8} {shown}  ✗ in use by SplitHello (pid {}) → `splithello stop` first",
+                    record.pid
+                ),
+                None => println!("{label:<8} {shown}  ✗ in use by another program"),
+            }
             false
         }
         Err(error) => {

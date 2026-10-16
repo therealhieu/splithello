@@ -269,7 +269,8 @@ pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     chain
 }
 
-/// Live tunnel counters for the periodic summary line.
+/// Live tunnel counters. They only grow, so the per-minute summary and `splithello status`
+/// can both read them: the summary logs the difference between two snapshots.
 #[derive(Debug, Default)]
 pub(crate) struct ProxyStats {
     active: AtomicU64,
@@ -279,16 +280,26 @@ pub(crate) struct ProxyStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WindowSummary {
+pub(crate) struct TunnelCounts {
     pub(crate) split: u64,
     pub(crate) direct: u64,
     pub(crate) failed: u64,
     pub(crate) active: u64,
 }
 
-impl WindowSummary {
+impl TunnelCounts {
     pub(crate) const fn tunnels(&self) -> u64 {
         self.split + self.direct + self.failed
+    }
+
+    /// Tunnels finished between `earlier` and `self`; `active` stays the current value.
+    pub(crate) const fn since(self, earlier: Self) -> Self {
+        Self {
+            split: self.split.saturating_sub(earlier.split),
+            direct: self.direct.saturating_sub(earlier.direct),
+            failed: self.failed.saturating_sub(earlier.failed),
+            active: self.active,
+        }
     }
 }
 
@@ -309,18 +320,18 @@ impl ProxyStats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns the counts since the previous call and resets them.
-    pub(crate) fn take_window(&self) -> WindowSummary {
-        WindowSummary {
-            split: self.split.swap(0, Ordering::Relaxed),
-            direct: self.direct.swap(0, Ordering::Relaxed),
-            failed: self.failed.swap(0, Ordering::Relaxed),
+    /// Totals since start, plus the tunnels open right now.
+    pub(crate) fn snapshot(&self) -> TunnelCounts {
+        TunnelCounts {
+            split: self.split.load(Ordering::Relaxed),
+            direct: self.direct.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
             active: self.active.load(Ordering::Relaxed),
         }
     }
 }
 
-pub(crate) fn log_summary(window: Duration, summary: WindowSummary) {
+pub(crate) fn log_summary(window: Duration, summary: TunnelCounts) {
     tracing::info!(
         window = %humantime::format_duration(window),
         tunnels = summary.tunnels(),
@@ -338,7 +349,7 @@ mod tests {
 
     use crate::domain::DomainName;
 
-    use super::{Outcome, ProxyStats, TunnelReport, WindowSummary, error_chain};
+    use super::{Outcome, ProxyStats, TunnelCounts, TunnelReport, error_chain};
 
     #[test]
     fn every_outcome_parses_back_and_failures_carry_hints() {
@@ -359,8 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_a_window_and_reset() {
+    fn stats_count_totals_and_windows_are_differences() {
         let stats = ProxyStats::default();
+        let start = stats.snapshot();
         for outcome in [
             Outcome::TargetTransformed,
             Outcome::DirectRelay,
@@ -374,10 +386,11 @@ mod tests {
             stats.closed(outcome);
         }
         stats.opened();
-        let window = stats.take_window();
+        let first = stats.snapshot();
+        let window = first.since(start);
         assert_eq!(
             window,
-            WindowSummary {
+            TunnelCounts {
                 split: 1,
                 direct: 2,
                 failed: 1,
@@ -385,7 +398,12 @@ mod tests {
             }
         );
         assert_eq!(window.tunnels(), 4);
-        assert_eq!(stats.take_window().tunnels(), 0);
+
+        stats.closed(Outcome::DirectRelay);
+        let second = stats.snapshot();
+        assert_eq!(second.since(first).tunnels(), 1);
+        assert_eq!(second.since(first).active, 0);
+        assert_eq!(second.tunnels(), 5, "totals never reset");
     }
 
     #[test]

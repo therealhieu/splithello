@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 
@@ -44,12 +44,30 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Start the local proxy; writes a starter configuration first if none exists.
-    Start(ConfigArgs),
+    Start(StartArgs),
+    /// Show whether SplitHello is running, where, and how much traffic it has carried.
+    /// Exits 0 when running, 3 when not.
+    Status,
+    /// Stop the running SplitHello after it drains open tunnels, as Ctrl-C would.
+    Stop(StopArgs),
     /// Validate the configuration, check listeners, and resolve every target over DoH.
     Check(ConfigArgs),
     /// Replace this binary with the newest release; Homebrew and Cargo installs print their
     /// upgrade command instead.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct StartArgs {
+    #[command(flatten)]
+    pub(crate) config: ConfigArgs,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct StopArgs {
+    /// Kill it at once instead, without draining; for an instance that does not respond.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -116,17 +134,35 @@ pub(crate) fn default_cache_path(file: &str) -> Option<PathBuf> {
     )
 }
 
+/// `$XDG_STATE_HOME/splithello`, else `~/.local/state/splithello`: the running instance's
+/// lock and `run.toml`.
+pub(crate) fn default_state_dir() -> Option<PathBuf> {
+    xdg_dir(
+        std::env::var_os("XDG_STATE_HOME"),
+        home_dir(),
+        &Path::new(".local").join("state"),
+    )
+}
+
 /// `HOME` on Unix, `USERPROFILE` on Windows.
 fn home_dir() -> Option<OsString> {
     std::env::home_dir().map(PathBuf::into_os_string)
 }
 
-/// XDG base-directory rule: a relative or empty `$XDG_*_HOME` is ignored.
 fn xdg_path(
     xdg_home: Option<OsString>,
     home: Option<OsString>,
     home_fallback: &str,
     file: &str,
+) -> Option<PathBuf> {
+    xdg_dir(xdg_home, home, Path::new(home_fallback)).map(|dir| dir.join(file))
+}
+
+/// XDG base-directory rule: a relative or empty `$XDG_*_HOME` is ignored.
+fn xdg_dir(
+    xdg_home: Option<OsString>,
+    home: Option<OsString>,
+    home_fallback: &Path,
 ) -> Option<PathBuf> {
     xdg_home
         .map(PathBuf::from)
@@ -136,7 +172,7 @@ fn xdg_path(
                 .filter(|path| path.is_absolute())
                 .map(|home| home.join(home_fallback))
         })
-        .map(|base| base.join("splithello").join(file))
+        .map(|base| base.join("splithello"))
 }
 
 #[cfg(test)]
@@ -146,7 +182,7 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, xdg_path};
+    use super::{Cli, Command, xdg_dir, xdg_path};
     use crate::logging::LogFormat;
 
     #[test]
@@ -155,7 +191,7 @@ mod tests {
         let Command::Start(args) = cli.command else {
             panic!("expected start");
         };
-        assert_eq!(args.config, None);
+        assert_eq!(args.config.config, None);
     }
 
     #[test]
@@ -165,7 +201,20 @@ mod tests {
         let Command::Start(args) = cli.command else {
             panic!("expected start");
         };
-        assert_eq!(args.path(), Some(PathBuf::from("config.toml")));
+        assert_eq!(args.config.path(), Some(PathBuf::from("config.toml")));
+    }
+
+    #[test]
+    fn status_and_stop_take_no_config() {
+        let cli = Cli::try_parse_from(["splithello", "status"]).expect("valid CLI");
+        assert!(matches!(cli.command, Command::Status));
+        let cli = Cli::try_parse_from(["splithello", "stop", "--force"]).expect("valid CLI");
+        let Command::Stop(args) = cli.command else {
+            panic!("expected stop");
+        };
+        assert!(args.force);
+        let error = Cli::try_parse_from(["splithello", "stop", "--config", "a.toml"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -222,26 +271,41 @@ mod tests {
 
     #[test]
     fn default_path_follows_xdg_then_home() {
-        let os = |value: &str| Some(OsString::from(value));
+        // Absolute on every OS; a literal "/xdg" is not absolute on Windows.
+        let root = std::env::temp_dir();
+        let (xdg, home) = (root.join("xdg"), root.join("home"));
+        let os = |path: &PathBuf| Some(path.clone().into_os_string());
         let config = |xdg, home| xdg_path(xdg, home, ".config", "config.toml");
         assert_eq!(
-            config(os("/xdg"), os("/home/me")),
-            Some(PathBuf::from("/xdg/splithello/config.toml"))
+            config(os(&xdg), os(&home)),
+            Some(xdg.join("splithello").join("config.toml"))
         );
         assert_eq!(
-            config(os("relative"), os("/home/me")),
-            Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
+            config(Some(OsString::from("relative")), os(&home)),
+            Some(home.join(".config").join("splithello").join("config.toml"))
         );
         assert_eq!(
-            config(None, os("/home/me")),
-            Some(PathBuf::from("/home/me/.config/splithello/config.toml"))
+            config(None, os(&home)),
+            Some(home.join(".config").join("splithello").join("config.toml"))
         );
+        assert_eq!(config(None, Some(OsString::from("relative"))), None);
         assert_eq!(config(None, None), None);
+        let state = std::path::Path::new(".local").join("state");
         assert_eq!(
-            xdg_path(None, os("/home/me"), ".cache", "update-check.toml"),
-            Some(PathBuf::from(
-                "/home/me/.cache/splithello/update-check.toml"
-            ))
+            xdg_dir(None, os(&home), &state),
+            Some(home.join(".local").join("state").join("splithello"))
+        );
+        assert_eq!(
+            xdg_dir(os(&xdg), os(&home), &state),
+            Some(xdg.join("splithello"))
+        );
+        assert_eq!(
+            xdg_path(None, os(&home), ".cache", "update-check.toml"),
+            Some(
+                home.join(".cache")
+                    .join("splithello")
+                    .join("update-check.toml")
+            )
         );
     }
 }

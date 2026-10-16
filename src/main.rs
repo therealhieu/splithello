@@ -1,9 +1,12 @@
 mod app;
 mod cli;
 mod config;
+mod control;
 mod diagnostics;
 mod dns;
 mod domain;
+mod instance;
+mod lifecycle;
 mod logging;
 mod pac;
 mod proxy;
@@ -12,57 +15,57 @@ mod tls;
 mod update;
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use app::{AppError, Runtime};
+use app::AppError;
 use clap::Parser;
 use cli::{Cli, Command, ConfigArgs};
 use config::{Config, ConfigError};
+use lifecycle::CommandStatus;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     logging::init(&cli.log_options());
+    let starting = matches!(cli.command, Command::Start(_));
     match run(cli).await {
-        Ok(true) => {}
-        Ok(false) => std::process::exit(1),
+        Ok(status) => status.into(),
         Err(error) => {
-            tracing::error!(
-                outcome = %error.outcome(),
-                error = %error,
-                hint = error.hint(),
-                "SplitHello stopped"
-            );
-            std::process::exit(1);
+            if starting {
+                tracing::error!(
+                    outcome = %error.outcome(),
+                    error = %error,
+                    hint = error.hint(),
+                    "SplitHello stopped"
+                );
+            } else {
+                tracing::error!(
+                    outcome = %error.outcome(),
+                    error = %error,
+                    hint = error.hint(),
+                    "command failed"
+                );
+            }
+            CommandStatus::Failed.into()
         }
     }
 }
 
-/// Returns `Ok(false)` when a command finished but reported failures (`check`) or stopped
-/// before doing anything because no targets are configured.
-async fn run(cli: Cli) -> Result<bool, AppError> {
+/// `Failed` when a command finished but reported failures (`check`) or stopped before doing
+/// anything because no targets are configured.
+async fn run(cli: Cli) -> Result<CommandStatus, AppError> {
     match cli.command {
-        Command::Start(args) => {
-            let Some(config) = load_config(&config_path(&args)?)? else {
-                return Ok(false);
-            };
-            let check_updates = update::check_enabled(config.update().check());
-            let mut runtime = Runtime::start(config).await?;
-            runtime.ready().emit();
-            if check_updates {
-                runtime.spawn_update_notifier();
-            }
-            let run_result = runtime.run_until_signal().await;
-            let shutdown_result = runtime.shutdown().await;
-            run_result.and(shutdown_result).map(|()| true)
-        }
+        Command::Start(args) => lifecycle::start(&args).await,
+        Command::Status => lifecycle::status().await,
+        Command::Stop(args) => lifecycle::stop(&args).await,
         Command::Check(args) => {
             let path = config_path(&args)?;
             let Some(config) = load_config(&path)? else {
-                return Ok(false);
+                return Ok(CommandStatus::Failed);
             };
-            setup::check(&path, &config).await
+            setup::check(&path, &config).await.map(CommandStatus::from)
         }
-        Command::Update(args) => update::run_command(&args).await,
+        Command::Update(args) => update::run_command(&args).await.map(CommandStatus::from),
     }
 }
 

@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record, RecordType};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -307,6 +310,7 @@ pub struct RunningSplitHello {
     pub pac_addr: Option<SocketAddr>,
     output: Arc<Mutex<String>>,
     directory: TempDir,
+    binary: PathBuf,
 }
 
 impl RunningSplitHello {
@@ -345,14 +349,11 @@ impl RunningSplitHello {
         let config_path = directory.path().join("config.toml");
         fs::write(&config_path, config_text).expect("write process configuration");
 
-        let mut child = Command::new(binary)
+        let mut child = isolated_command(binary, directory.path())
             .arg("start")
             .arg("--config")
             .arg(&config_path)
             .env("RUST_LOG", rust_log)
-            // Tests and benchmarks stay off GitHub and out of the real cache directory.
-            .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
-            .env("XDG_CACHE_HOME", directory.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -383,7 +384,35 @@ impl RunningSplitHello {
             pac_addr,
             output,
             directory,
+            binary: binary.to_path_buf(),
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The same binary, with this instance's state and cache directories, so `status` and
+    /// `stop` find it.
+    pub fn command(&self) -> Command {
+        isolated_command(&self.binary, self.directory.path())
+    }
+
+    /// Runs another SplitHello command against this instance and waits for it.
+    pub fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.command()
+            .args(args)
+            .env("RUST_LOG", "info")
+            .output()
+            .expect("run splithello command")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.directory.path().join("config.toml")
+    }
+
+    pub fn state_dir(&self) -> PathBuf {
+        self.directory.path().join("splithello")
     }
 
     pub fn output(&self) -> String {
@@ -396,6 +425,27 @@ impl RunningSplitHello {
 
     pub fn wait_for_output(&self, needle: &str) -> String {
         wait_for_captured_output(&self.output, needle)
+    }
+
+    /// Asks the process to shut down gracefully, as Ctrl-C would. Returns at once; follow
+    /// with [`Self::wait_for_exit`].
+    #[cfg(unix)]
+    pub fn interrupt(&mut self) {
+        self.signal("INT");
+    }
+
+    /// Windows has no signal to send a console-less child, so this is `splithello stop`,
+    /// started without waiting, like a signal.
+    #[cfg(not(unix))]
+    pub fn interrupt(&mut self) {
+        let mut stop = self
+            .command()
+            .arg("stop")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start splithello stop");
+        std::thread::spawn(move || stop.wait());
     }
 
     #[cfg(unix)]
@@ -447,15 +497,32 @@ impl TestConfig<'_> {
             .map(|secret| format!("# {secret}\n"))
             .unwrap_or_default();
         format!(
-            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = \"{}\"\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
+            "{secret}targets = [{{ host = \"{}\", subdomains = true }}]\n\n[proxy]\nlisten = \"{proxy}\"\npac = {pac}\nports = [{}]\n\n[dns]\nupstream = \"{}\"\nca_certificate = {}\ntimeout = \"1s\"\ncache_ttl = \"30s\"\ncache_size = 8\nmax_response_bytes = 4096\n\n[limits]\nmax_connect_header_bytes = 4096\nmax_client_hello_bytes = 4096\nmax_connections = {}\nconnect_timeout = \"1s\"\nclient_hello_timeout = \"1s\"\nidle_timeout = \"2s\"\nshutdown_timeout = \"{}s\"\n",
             self.target_host,
             self.origin_port,
             self.doh.url(),
-            self.doh.ca_pem.display(),
+            toml_path(&self.doh.ca_pem),
             self.max_connections,
             self.shutdown_seconds,
         )
     }
+}
+
+/// `binary` with its state and cache in `directory`: off GitHub, out of the real cache, and
+/// never seeing a SplitHello another test (or the developer) runs.
+pub fn isolated_command(binary: &Path, directory: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .env("SPLITHELLO_NO_UPDATE_CHECK", "1")
+        .env("XDG_CACHE_HOME", directory)
+        .env("XDG_STATE_HOME", directory)
+        .env_remove("RUST_LOG");
+    command
+}
+
+/// `path` as a quoted TOML string; Windows backslashes would otherwise be read as escapes.
+pub fn toml_path(path: &Path) -> String {
+    toml::Value::String(path.display().to_string()).to_string()
 }
 
 pub async fn connect_via_proxy(proxy: SocketAddr, authority: &str) -> TcpStream {
@@ -581,6 +648,9 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let mut ca_params = CertificateParams::new(vec!["SplitHello test CA".to_owned()])
         .expect("create CA parameters");
+    // Distinct subjects: rcgen's default would make the server certificate's issuer equal
+    // its subject, and Windows then checks it as self-signed and rejects its signature.
+    ca_params.distinguished_name = common_name("SplitHello test CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -600,8 +670,13 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
-    let server_params =
-        CertificateParams::new(names).expect("create server certificate parameters");
+    let mut server_params =
+        CertificateParams::new(names.clone()).expect("create server certificate parameters");
+    server_params.distinguished_name = common_name(
+        names
+            .first()
+            .map_or("SplitHello test server", String::as_str),
+    );
     let server_key = KeyPair::generate().expect("generate server key");
     let server_cert = server_params
         .signed_by(&server_key, &issuer)
@@ -617,6 +692,12 @@ pub fn tls_material(directory: &Path, names: &[&str]) -> TlsMaterial {
         ca_der,
         server,
     }
+}
+
+fn common_name(name: &str) -> DistinguishedName {
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, name);
+    distinguished_name
 }
 
 async fn sleep_rtt(duration: Duration) {

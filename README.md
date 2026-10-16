@@ -35,6 +35,33 @@ Keep it running while you browse. A ready banner (`outcome=ready` when piped) me
 
 To stop, press `Ctrl-C` and remove the browser's proxy or PAC setting. SplitHello makes no persistent network, firewall, resolver, or certificate changes.
 
+### Check on or stop a running SplitHello
+
+From any terminal:
+
+```sh
+splithello status         # pid, uptime, addresses, open tunnels, totals; exits 3 when not running
+splithello stop           # lets open tunnels finish (up to limits.shutdown_timeout), then exits
+splithello stop --force   # exits at once, for an instance that does not answer
+```
+
+```text
+SplitHello 0.1.0 running · pid 4242 · up 2h 3m 4s
+  proxy    127.0.0.1:8080
+  pac      http://127.0.0.1:8081/proxy.pac
+  config   /home/me/.config/splithello/config.toml
+  tunnels  2 open · 120 split, 340 direct, 3 failed since start
+```
+
+Only one SplitHello runs per user: a second `start` stops with `SplitHello is already running (pid …)`. The running instance keeps two files in `~/.local/state/splithello/` (`$XDG_STATE_HOME` if set):
+
+| File | Content |
+|---|---|
+| `splithello.lock` | Empty. Locked while SplitHello runs; the lock goes away with the process, even after a crash. |
+| `run.toml` | Its pid, addresses, config path, and a random control token. Owner-only; removed when it exits. |
+
+`stop` and `status` reach SplitHello over a loopback port that answers only to that token. On macOS and Linux, `SIGTERM` stops it the same way.
+
 ### Use another config file
 
 Pass `--config <PATH>` to `start`, `check`, or `update`:

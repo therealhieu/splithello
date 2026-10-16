@@ -10,9 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::default_cache_path;
 use crate::config::{Config, ConfigError};
+use crate::control::{ControlError, ControlServer, ControlToken};
 use crate::diagnostics::{Outcome, ProxyStats, log_summary};
 use crate::dns::{DohResolver, ResolveError};
 use crate::domain::{DomainError, DomainName};
+use crate::instance::InstanceError;
 use crate::pac::{PacServer, PacServiceError, render_pac};
 use crate::proxy::{ProxyLimits, ProxyServer, ProxyServiceError, ProxyState};
 use crate::update::{self, ReleaseSource, UpdateError};
@@ -28,12 +30,10 @@ pub(crate) struct ReadyMetadata {
 }
 
 impl ReadyMetadata {
-    #[cfg(test)]
     pub(crate) fn proxy_addr(&self) -> SocketAddr {
         self.proxy_addr
     }
 
-    #[cfg(test)]
     pub(crate) fn pac_url(&self) -> Option<&str> {
         self.pac_url.as_deref()
     }
@@ -107,8 +107,20 @@ pub(crate) enum AppError {
     ServiceStopped,
     #[error("runtime task failed")]
     Task(#[source] JoinError),
-    #[error("could not install or receive shutdown signal")]
-    Signal(#[source] std::io::Error),
+    #[error(transparent)]
+    Instance(#[from] InstanceError),
+    #[error(transparent)]
+    Control(#[from] ControlError),
+    #[error("SplitHello is starting but has not said how to reach it yet")]
+    Starting,
+    #[error("SplitHello (pid {pid}) is still running after {}", humantime::format_duration(*.waited))]
+    StillRunning { pid: u32, waited: Duration },
+    #[error("could not stop SplitHello (pid {pid})")]
+    Kill {
+        pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("update failed: {0}")]
     Update(#[from] UpdateError),
     #[error("could not ask for confirmation")]
@@ -127,8 +139,17 @@ impl AppError {
             | Self::ListenerAddress(_)
             | Self::ProxyService(_)
             | Self::PacService(_) => Outcome::ConnectError,
-            Self::ServiceStopped | Self::Task(_) => Outcome::InternalError,
-            Self::Signal(_) | Self::Prompt(_) => Outcome::InternalError,
+            Self::ServiceStopped | Self::Task(_) | Self::Prompt(_) => Outcome::InternalError,
+            // Like a busy port: something else already holds what `start` needs.
+            Self::Instance(InstanceError::AlreadyRunning { .. }) => Outcome::ConnectError,
+            Self::Instance(_) => Outcome::InternalError,
+            Self::Control(ControlError::Random(_) | ControlError::Bind(_)) => {
+                Outcome::InternalError
+            }
+            Self::Control(_) => Outcome::ConnectError,
+            Self::Starting | Self::StillRunning { .. } | Self::Kill { .. } => {
+                Outcome::InternalError
+            }
             Self::Update(_) => Outcome::ConnectError,
         }
     }
@@ -140,6 +161,19 @@ impl AppError {
                 "check the connection, or download the release from \
                  https://github.com/therealhieu/splithello/releases",
             ),
+            Self::Instance(error) => match error.hint() {
+                Some(hint) => Some(hint),
+                None => self.outcome().hint(),
+            },
+            Self::Control(ControlError::Rejected(_)) => Some(
+                "run.toml does not match the running instance; \
+                 `splithello stop --force` stops it anyway",
+            ),
+            Self::Control(ControlError::Connect { .. } | ControlError::Timeout(_)) => {
+                Some("`splithello stop --force` stops it without draining")
+            }
+            Self::StillRunning { .. } => Some("`splithello stop --force` stops it at once"),
+            Self::Starting => Some("try again in a moment"),
             _ => self.outcome().hint(),
         }
     }
@@ -151,6 +185,7 @@ pub(crate) struct Runtime {
     shutdown_timeout: Duration,
     ready: ReadyMetadata,
     resolver: Arc<DohResolver>,
+    stats: Arc<ProxyStats>,
 }
 
 impl Runtime {
@@ -235,7 +270,7 @@ impl Runtime {
             );
             tasks.spawn(async move { pac.run().await.map_err(AppError::from) });
         }
-        tasks.spawn(report_summaries(stats, cancel.child_token()));
+        tasks.spawn(report_summaries(Arc::clone(&stats), cancel.child_token()));
         // Detached: it finishes on its own, which `tasks` would read as a stopped service.
         tokio::spawn(prewarm_targets(
             target_resolver.clone(),
@@ -253,11 +288,28 @@ impl Runtime {
             shutdown_timeout,
             ready,
             resolver: target_resolver,
+            stats,
         })
     }
 
     pub(crate) fn ready(&self) -> &ReadyMetadata {
         &self.ready
+    }
+
+    /// Serves `status` and `stop` on `listener`. A `STOP` cancels the whole runtime, so
+    /// shutdown drains exactly as on Ctrl-C.
+    pub(crate) fn spawn_control(&mut self, listener: TcpListener, token: ControlToken) {
+        let server = ControlServer::new(
+            listener,
+            token,
+            Arc::clone(&self.stats),
+            self.cancel.clone(),
+            self.shutdown_timeout,
+        );
+        self.tasks.spawn(async move {
+            server.run().await;
+            Ok(())
+        });
     }
 
     /// Starts the daily check for a newer release. Detached like the prewarm: it never
@@ -281,19 +333,37 @@ impl Runtime {
     }
 
     pub(crate) async fn run_until_signal(&mut self) -> Result<(), AppError> {
-        tokio::select! {
-            _ = self.cancel.cancelled() => Ok(()),
-            signal = shutdown_signal() => {
-                signal.map_err(AppError::Signal)?;
-                self.cancel.cancel();
-                Ok(())
-            }
-            joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
-                match joined {
-                    Some(Ok(Ok(()))) => Err(AppError::ServiceStopped),
-                    Some(Ok(Err(error))) => Err(error),
-                    Some(Err(error)) => Err(AppError::Task(error)),
-                    None => Err(AppError::ServiceStopped),
+        let signal = shutdown_signal();
+        tokio::pin!(signal);
+        let mut listening = true;
+        loop {
+            tokio::select! {
+                // Cancellation first: a `STOP` makes services finish with `Ok`, which the
+                // `join_next` branch would otherwise report as an unexpected stop.
+                biased;
+                _ = self.cancel.cancelled() => return Ok(()),
+                signal = &mut signal, if listening => match signal {
+                    Ok(()) => {
+                        self.cancel.cancel();
+                        return Ok(());
+                    }
+                    // A detached process has no console on Windows; the control channel
+                    // still stops it, so this must not take the proxy down.
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "could not listen for Ctrl-C; `splithello stop` stops SplitHello"
+                        );
+                        listening = false;
+                    }
+                },
+                joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    return match joined {
+                        Some(Ok(Ok(()))) => Err(AppError::ServiceStopped),
+                        Some(Ok(Err(error))) => Err(error),
+                        Some(Err(error)) => Err(AppError::Task(error)),
+                        None => Err(AppError::ServiceStopped),
+                    };
                 }
             }
         }
@@ -312,11 +382,14 @@ async fn report_summaries(
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let mut interval = tokio::time::interval_at(Instant::now() + SUMMARY_WINDOW, SUMMARY_WINDOW);
+    let mut previous = stats.snapshot();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             _ = interval.tick() => {
-                let window = stats.take_window();
+                let now = stats.snapshot();
+                let window = now.since(previous);
+                previous = now;
                 if window.tunnels() > 0 {
                     log_summary(SUMMARY_WINDOW, window);
                 }
@@ -408,6 +481,7 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     use crate::config::Config;
+    use crate::control::{ControlToken, Verb, request};
     use crate::diagnostics::Outcome;
 
     use super::{AppError, Runtime, drain_tasks};
@@ -489,6 +563,29 @@ mod tests {
             .unwrap();
         runtime.shutdown().await.unwrap();
         assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    /// A `STOP` finishes every service with `Ok`; the run must still count as a clean stop,
+    /// not "service stopped unexpectedly". Repeated because the race only sometimes loses.
+    #[tokio::test]
+    async fn a_control_stop_ends_the_run_cleanly() {
+        for _ in 0..20 {
+            let config = load_config(&config_text("127.0.0.1:0", None, 1));
+            let mut runtime = Runtime::start(config).await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let token = ControlToken::generate().unwrap();
+            runtime.spawn_control(listener, token.clone());
+            request(address, &token, Verb::Stop).await.unwrap();
+            // Let the services finish first, so the cancellation and a finished task are
+            // both ready when `run_until_signal` looks: the moment the race happens.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            timeout(Duration::from_secs(2), runtime.run_until_signal())
+                .await
+                .expect("STOP ends the run")
+                .expect("a requested stop is not an error");
+            runtime.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

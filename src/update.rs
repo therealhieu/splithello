@@ -127,8 +127,8 @@ impl ReleaseSource {
         })
     }
 
-    /// A plain-HTTP source for a local fake of GitHub's API.
-    #[cfg(test)]
+    /// A plain-HTTP source for a local fake of GitHub's API; its tests build Unix archives.
+    #[cfg(all(test, unix))]
     fn local(api_base: String) -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -225,6 +225,11 @@ impl CacheEntry {
         now.checked_sub(self.checked_at)
             .is_some_and(|age| age < CHECK_INTERVAL.as_secs())
     }
+}
+
+/// The newest release the last check saw, without asking GitHub again.
+pub(crate) fn cached_latest(path: &Path) -> Option<String> {
+    read_cache(path).map(|entry| entry.latest)
 }
 
 fn read_cache(path: &Path) -> Option<CacheEntry> {

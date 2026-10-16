@@ -44,19 +44,39 @@ jobs:
           echo "bench=$([[ -n "$code" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   # Fail open: if `changes` breaks, its outputs are empty and everything runs.
-  check:
+  # Every released OS runs the tests: background mode and the control channel differ per OS.
+  test:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.check != 'false' }}
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
+      - if: runner.os == 'macOS'
+        run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The required status check keeps its name while `test` fans out per OS; a skipped `test`
+  # (markdown-only change) passes, a failed or cancelled one fails.
+  check:
+    needs: [changes, test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULT: ${{ needs.test.result }}
+        run: '[[ "$RESULT" == success || "$RESULT" == skipped ]]'
 
   # Merge rule: "faster or equal". A PR fails if any scenario is significantly slower than
   # its base branch (whole 95% CI above +1%). Base and PR binaries are measured in alternating rounds on the
